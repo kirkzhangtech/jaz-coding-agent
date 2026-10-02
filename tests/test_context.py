@@ -12,12 +12,17 @@ from __future__ import annotations
 import pytest
 
 from jaz_agent.context import (
+    DIGEST_FRACTION,
     DIGEST_HEADER,
+    DIGEST_MAX_TURNS,
+    GRADE_NEWEST,
+    GRADE_OLDEST,
     RECENT_TURNS,
     TASK_HEAD_CHARS,
     WORTHWHILE,
     Context,
     Turn,
+    _grade,
     _is_digest,
     report,
 )
@@ -80,7 +85,7 @@ def test_turns_below_the_window_are_sent_verbatim():
     ctx = filled(RECENT_TURNS - 1)
     messages = ctx.prompt()
     assert [m["content"] for m in messages if m["role"] == "user"] == [
-        f"task {i} " + "t" * 10 for i in range(RECENT_TURNS - 1)
+        f"task {i} " + "t" * 60 for i in range(RECENT_TURNS - 1)
     ]
     assert all("condensed" not in m["content"] for m in messages)
 
@@ -90,7 +95,7 @@ def test_old_turns_become_one_digest_message():
     messages = ctx.prompt()
     digests = [m for m in messages if _is_digest(m)]
     assert len(digests) == 1, "old turns should collapse into a single message"
-    assert f"[{10 - RECENT_TURNS} earlier turn(s), condensed]" in digests[0]["content"]
+    assert f"[{10 - RECENT_TURNS} earlier turn(s), condensed" in digests[0]["content"]
 
 
 def test_the_newest_turn_is_never_condensed():
@@ -105,7 +110,7 @@ def test_recent_window_is_configurable():
     ctx = filled(6)
     ctx.recent = 2
     digest = next(m for m in ctx.prompt() if _is_digest(m))
-    assert "[4 earlier turn(s), condensed]" in digest["content"]
+    assert "[4 earlier turn(s), condensed" in digest["content"]
     assert "task 5" not in digest["content"], (
         "turn 5 is inside a window of 2 and must stay verbatim"
     )
@@ -116,7 +121,7 @@ def test_zero_window_condenses_everything():
     ctx.recent = 0
     messages = ctx.prompt()
     assert len(messages) == 1
-    assert "[4 earlier turn(s), condensed]" in messages[0]["content"]
+    assert "[4 earlier turn(s), condensed" in messages[0]["content"]
 
 
 # -- the budget ------------------------------------------------------------
@@ -133,7 +138,7 @@ def test_the_budget_is_not_a_turn_count():
     """A generous budget must not shrink -- four short turns fit easily."""
     ctx = filled(4)
     ctx.budget = 100_000
-    assert Context._cost(ctx.prompt()) < 1000
+    assert Context._cost(ctx.prompt()) < 10_000
 
 
 def test_a_tiny_budget_still_keeps_the_newest_turn():
@@ -186,6 +191,68 @@ def test_the_digest_header_constant_is_what_is_matched():
     ctx = filled(10)
     digest = next(m for m in ctx.prompt() if _is_digest(m))
     assert _is_digest(digest) == digest["content"].startswith(DIGEST_HEADER)
+
+
+# -- grading detail by age -------------------------------------------------
+
+
+def test_older_condensed_turns_keep_less_detail():
+    """The digest grades detail by age, which is what makes it scale."""
+    ctx = filled(10)
+    digest = next(m for m in ctx.prompt() if _is_digest(m))["content"]
+    head, _, tail = digest.partition("condensed; oldest first")
+    assert len(tail) > 0
+
+    entries = [ln for ln in tail.splitlines() if ln.startswith("- asked:")]
+    assert len(entries) >= 2
+    sizes = [len(ln) for ln in entries]
+    assert sizes == sorted(sizes), f"detail should grow with recency: {sizes}"
+
+
+def test_grading_runs_from_oldest_to_newest():
+    assert _grade(0, 5) == GRADE_OLDEST
+    assert _grade(4, 5) == GRADE_NEWEST
+    assert _grade(2, 5) == pytest.approx((GRADE_OLDEST + GRADE_NEWEST) / 2)
+
+
+def test_a_single_condensed_turn_gets_full_detail():
+    assert _grade(0, 1) == GRADE_NEWEST
+
+
+def test_grade_never_reaches_zero():
+    """A grade of zero would elide the whole turn, which is dropping it with
+    extra steps."""
+    assert GRADE_OLDEST > 0
+    assert 0 < _grade(0, 1000)
+
+
+# -- the digest is itself bounded -----------------------------------------
+
+
+def test_a_very_long_history_still_produces_one_fitting_digest():
+    """The measured failure: 26 fat turns graded by age came to 8,893 chars
+    against a 3,000 cap, so the digest was rejected and 24 turns were dropped
+    outright. Capping the number of turns described is what fixed it."""
+    ctx = filled(200)
+    messages = ctx.prompt()
+    digest = next(m for m in messages if _is_digest(m))
+    assert Context._cost([digest]) <= ctx.budget * DIGEST_FRACTION
+    assert ctx.describe().dropped == 0
+
+
+def test_turns_beyond_the_cap_are_counted_rather_than_summarised():
+    ctx = filled(200)
+    digest = next(m for m in ctx.prompt() if _is_digest(m))["content"]
+    assert "summarised to a count" in digest
+
+
+def test_the_cap_is_not_reached_when_the_history_is_short():
+    ctx = filled(RECENT_TURNS + DIGEST_MAX_TURNS)
+    digest = next(m for m in ctx.prompt() if _is_digest(m))["content"]
+    assert "summarised to a count" not in digest
+
+
+# -- the report ------------------------------------------------------------
 
 
 def test_a_trim_never_leaves_an_orphaned_assistant_reply():
@@ -291,11 +358,21 @@ def test_report_shows_the_history_sent_whole_when_it_is():
 
 def test_report_counts_dropped_turns_rather_than_guessing():
     """`_fit` can shed turns the policy never mentioned; the report has to say so."""
-    ctx = filled(30, size=500, report_size=900)
+    ctx = filled(30)
     ctx.budget = 100
     text = report(ctx)
     assert "dropped" in text
-    assert "[   dropped]" in text
+    assert "[  dropped]" in text, "dropped turns must be labelled as such"
+
+
+def test_dropped_turns_are_the_oldest():
+    """Losing the newest turn would mean the agent cannot see what it just did."""
+    ctx = filled(30)
+    ctx.budget = 100
+    states = [ln.split("[")[1].split("]")[0].strip() for ln in report(ctx).splitlines()
+              if ". [" in ln]
+    assert states[-1] == "verbatim"
+    assert set(states[:-1]) == {"dropped"}
 
 
 def test_a_condensed_turn_is_not_reported_as_dropped():
@@ -327,3 +404,79 @@ def test_prompt_is_stable_across_calls():
     """`/context` must not perturb what the next turn sends."""
     ctx = filled(10)
     assert ctx.prompt() == ctx.prompt()
+
+
+# -- wiring into the session and the command -------------------------------
+
+
+def test_the_session_records_turns_in_the_context(monkeypatch):
+    """`run_sync` is the path both the TUI and `--prompt` take."""
+    from jaz import MockLLMClient
+
+    from jaz_agent.session import AgentSession
+
+    monkeypatch.setenv("OPENROUTER_API_KEY", "sk-or-test")
+    session = AgentSession(llm=MockLLMClient(fn=lambda *a, **k: "return finish('done')"))
+    session.max_iterations = 4
+
+    assert session.run_sync("first task") == "done"
+    assert [t.task for t in session.context.turns] == ["first task"]
+    assert session.context.turns[0].report == "done"
+
+
+def test_prior_turns_reaches_jaz_as_a_bounded_list(monkeypatch):
+    """The integration point: what `_run_turn` passes is what `prompt` returns.
+
+    The mock records the rendered messages, which is a stronger check than a
+    model-level test: it shows what the model is actually shown, rather than
+    what it did with it.
+    """
+    import re
+
+    from jaz import MockLLMClient
+
+    from jaz_agent.session import AgentSession
+
+    monkeypatch.setenv("OPENROUTER_API_KEY", "sk-or-test")
+    seen: list[str] = []
+
+    def capture(model, messages, **kwargs):
+        seen.append(messages[-1]["content"])
+        return "return finish('ok')"
+
+    session = AgentSession(llm=MockLLMClient(fn=capture))
+    session.max_iterations = 4
+    for i in range(RECENT_TURNS + 4):
+        session.run_sync(f"task {i}")
+
+    block = re.search(r"<prior_turns.*?</prior_turns>", seen[-1], re.S)
+    assert block, "prior_turns must be rendered into the prompt"
+    assert "task 0" in block.group(0), "condensed history must survive into the prompt"
+    assert session.context.turns[-1].task in seen[-1], "the live task is passed as `task`"
+
+
+def test_the_context_command_is_registered_and_dispatched(monkeypatch):
+    """A command in the table with no handler says "not implemented" -- worse
+    than not listing it at all."""
+    from jaz_agent.commands import find
+    from jaz_agent.session import AgentSession
+    from jaz_agent.tui import CodingAgentApp
+
+    monkeypatch.setenv("OPENROUTER_API_KEY", "sk-or-test")
+    assert find("/context") is not None
+
+    session = AgentSession()
+    session.context.add("do a thing", "did the thing")
+
+    app = CodingAgentApp.__new__(CodingAgentApp)
+    app.session = session
+    app.status = None
+    app.transcript = None
+    app.started = 0.0
+    said: list[str] = []
+    app._say = lambda text, kind=None: said.append(text)  # type: ignore[method-assign]
+
+    app.action_context()
+
+    assert said, "/context must say something"
+    assert "do a thing" in said[0]

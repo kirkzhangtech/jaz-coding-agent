@@ -81,7 +81,7 @@ Inside the TUI:
 | `Ctrl+Q`  | quit                      |
 
 Commands: `/help` `/status` `/switchmodules [model]` `/backends` `/new` `/clear`
-`/cancel` `/cost` `/quit`. `/help` prints the full list.
+`/cancel` `/cost` `/context` `/quit`. `/help` prints the full list.
 
 Every action has a slash command, and the shortcut keys are only duplicates of
 one. That was not true when a function key could clear the conversation on its
@@ -424,18 +424,21 @@ else follows from bridging that gap without locks.
 
 | Module            | Lines | Responsibility                                                        |
 | ----------------- | ----: | --------------------------------------------------------------------- |
-| `tui.py`          |  1240 | Widgets, event loop, status bar, slash commands, the scrolling model browser. The only module that touches widgets. |
-| `tools.py`        |   366 | The 8 tools the agent calls. Path confinement lives in `_resolve`.     |
-| `llm_config.py`   |   341 | The backend registry: routes, keys, model discovery, the switch probe, error redaction. |
-| `session.py`      |   311 | One `invoke` per turn on a worker thread. Owns the REPL sandbox and the current model. |
-| `bridge.py`       |   242 | `jaz` `Hook` → `Event` objects on a queue. Never blocks, never raises. |
-| `commands.py`     |   316 | The command table and the navigable row type, shared by the command list and the model browser. One source for dispatch, `/help`, the vertical list and Tab completion. |
-| `__main__.py`     |   165 | CLI parsing and dispatch.                                               |
-| `check.py`        |    76 | Live end-to-end smoke test.                                             |
+| `tui.py`          |  1050 | Widgets, event loop, status bar, slash commands, the scrolling model browser. The only module that touches widgets. |
+| `tools.py`        |   294 | The 8 tools the agent calls. Path confinement lives in `_resolve`.     |
+| `llm_config.py`   |   274 | The backend registry: routes, keys, model discovery, the switch probe, error redaction. |
+| `session.py`      |   260 | One `invoke` per turn on a worker thread. Owns the REPL sandbox and the current model. |
+| `context.py`      |   367 | Conversation memory: what is recorded, what is condensed, and what is sent. `/context` renders it. |
+| `bridge.py`       |   197 | `jaz` `Hook` → `Event` objects on a queue. Never blocks, never raises. |
+| `commands.py`     |   261 | The command table and the navigable row type, shared by the command list and the model browser. One source for dispatch, `/help`, the vertical list and Tab completion. |
+| `__main__.py`     |   135 | CLI parsing and dispatch.                                               |
+| `check.py`        |    61 | Live end-to-end smoke test.                                             |
 
 Dependencies point one way: `tui` → `session` → `bridge` + `tools` +
-`llm_config`, with `tui` → `commands`. Nothing below `tui` imports Textual,
-which is what makes the lower two thirds testable without a terminal.
+`context` + `llm_config`, with `tui` → `commands`. `context.py` imports
+nothing but the standard library, so the memory policy can be tested without a
+model or a terminal. Nothing below `tui` imports Textual, which is what makes
+the lower two thirds testable without a terminal.
 
 `commands.py` is deliberately pure — a tuple of frozen dataclasses, a
 navigation row type, and a few functions, no imports. The table drives the
@@ -458,7 +461,9 @@ into the module that everything else imports from.
 ### One turn, end to end
 
 1. `on_input_submitted` fires on the Textual thread → `_send`.
-2. `AgentSession.submit` appends to `history`, spawns a **daemon thread**, returns.
+2. `AgentSession.submit` spawns a **daemon thread**, returns. (The turn is
+   recorded in `Context` once it completes, not on submit — see
+   [Context and compression](#context-and-compression).)
 3. The worker calls `jaz.invoke(...)` with `task`, `tools`, `guidance`, and
    `prior_turns`. jaz configures the LLM and REPL, then loops:
    - **LLM turn** — the model replies with Python code.
@@ -472,6 +477,75 @@ into the module that everything else imports from.
    widget, so no lock or `call_from_thread` is needed anywhere.
 6. The `idle` marker on the last event flips the status bar back to `ready` and
    re-enables the prompt.
+
+### Context and compression
+
+`jaz.invoke` is stateless — every call is a fresh loop with a fresh context. A
+conversational agent has to supply the memory itself, and `context.py` is where
+that happens. The input is `prior_turns`, which jaz renders into the user
+message as a single `<prior_turns type="list">` block.
+
+Two decisions carry the module.
+
+**The record is unbounded; only the prompt is bounded.** Every completed turn
+appends to `Context.turns` for the life of the session, and `/new` is the only
+thing that clears it. What is capped is `Context.prompt()` — the 12,000
+characters that actually reach the model. Losing the record and losing the
+ability to recall it are different failures, and only the second is a bug.
+
+**Compression has to be worth it.** Condensing is not automatically an
+improvement. A digest carries fixed overhead — its header, plus `asked:`/`did:`
+per turn — so a session of short turns comes out *larger* condensed than
+verbatim. `WORTHWHILE` refuses the digest in that case, because a summary that
+saves nothing while removing detail is strictly worse than no summary. Measured
+break-even is around 420 characters of report; real reports are 800–2,000.
+
+What survives a prompt:
+
+| Turn age | Treatment |
+| -------- | -------- |
+| last 4 (`RECENT_TURNS`) | verbatim, always |
+| next 8 (`DIGEST_MAX_TURNS`) | condensed, detail graded by age — newest keeps all of it, oldest a quarter |
+| older than that | counted, not described |
+| still over budget | dropped from the oldest end; the newest turn is kept even so |
+
+Grading detail by age is what makes the digest *scale*. A flat clip does not
+compress: at a fixed 240/120 characters a 900-character report keeps a third of
+itself, and 26 turns came to 8,893 characters against a 6,000 cap — the digest
+was rejected outright and 24 turns dropped. Capping the number of turns
+described, rather than the size of each, is the only thing that fits.
+
+Two structural choices matter for correctness. Prompts are assembled from
+*blocks* rather than a flat message list, so trimming sheds a whole turn rather
+than landing between a turn's `user` and `assistant` halves and producing a
+transcript that opens with the model answering itself. And `build()` returns the
+messages and a `Plan` describing what it did **together**, so `/context` reports
+the prompt's real behaviour instead of re-deriving it — an earlier version
+counted assistant messages and cheerfully reported 26 turns "dropped" on a
+prompt that contained all 30, condensed. A summary of the context that lies
+about the context is the one failure this module cannot have.
+
+`/context` renders the result:
+
+```
+Context: 8 turn(s) recorded, 4 condensed, 4 verbatim.
+
+  record              8,140 chars   full history, always kept
+  next prompt         5,140 chars   what gets sent to the model
+  budget             12,000 chars
+  verbatim window         4 turns
+  -> 3,000 chars condensed away
+
+Turns, oldest first:
+    1. [condensed] refactor the parser in module 0 so it handles nested
+    2. [condensed] refactor the parser in module 1 so it handles nested
+    3. [condensed] refactor the parser in module 2 so it handles nested
+    4. [condensed] refactor the parser in module 3 so it handles nested
+    5. [ verbatim] refactor the parser in module 4 so it handles nested
+    6. [ verbatim] refactor the parser in module 5 so it handles nested
+    7. [ verbatim] refactor the parser in module 6 so it handles nested
+    8. [ verbatim] refactor the parser in module 7 so it handles nested
+```
 
 ### Why a queue and not `call_from_thread`
 
@@ -680,7 +754,7 @@ model to check before answering. See
 .\.venv\Scripts\python.exe -m pytest tests/ -q
 ```
 
-143 tests, no network and no API key. They cover the tool catalog, path
+196 tests, no network and no API key. They cover the tool catalog, path
 confinement, the bridge payload, the agent loop (including recovery from a tool
 error), conversation memory, the architectural layering, the command table
 (usage strings, alias resolution, help output, the vertical list at every width

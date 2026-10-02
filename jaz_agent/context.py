@@ -44,15 +44,21 @@ TASK_HEAD_CHARS = 600
 #: the verification. The middle is where a long file listing sits, and it is the
 #: cheapest thing to lose.
 #:
-#: These have to be small. A digest's entire value is that it is smaller than
-#: what it replaces: at 400/200 a 400-character report is copied essentially
-#: whole, the digest comes out *larger* than the original, and
-#: :data:`WORTHWHILE` then correctly refuses to condense anything at all. The
-#: numbers are therefore sized so that a typical report loses its middle, and
-#: the fixed cost per turn ("- asked:" / "  did:") stays a small fraction of
-#: what a real report occupies.
 REPORT_HEAD_CHARS = 240
 REPORT_TAIL_CHARS = 120
+
+#: How much of a condensed turn survives, for a turn at each end of the
+#: condensed range. The newest keeps all of it; the oldest keeps a quarter.
+#:
+#: A flat clip does not actually compress. At 240/120 a 900-character report
+#: still keeps 360 characters, so a digest of twenty turns costs more than half
+#: of what it replaces and cannot fit the budget it exists to satisfy -- the
+#: measured ratio was 12386 chars of digest against 25408 of history, against a
+#: 3000-char cap. Grading the clip by age makes the digest *scale*: recency is
+#: exactly what gives an old turn its value, so the newest condensed turn stays
+#: nearly whole and the oldest is reduced to a bare claim.
+GRADE_NEWEST = 1.0
+GRADE_OLDEST = 0.25
 
 #: First line of the message standing in for condensed turns. Doubles as the
 #: marker used to recognise a digest, so the two cannot drift apart.
@@ -69,10 +75,31 @@ WORTHWHILE = 1.0
 #: fit inside. Half leaves room for the verbatim window beside it.
 DIGEST_FRACTION = 0.5
 
-#: Characters reserved for the digest's two header lines while deciding how many
-#: turns fit. The header names the count, which is not known until the count is,
-#: so a fixed allowance stands in for it rather than iterating.
-_HEADER_SLACK = 80
+#: Most condensed turns a digest will describe individually. Past this the
+#: oldest are folded into a count rather than summarised, because there is a
+#: floor below which a condensed turn stops being readable -- roughly 250
+#: characters of task and report no matter how aggressively it is graded -- and
+#: 40 turns at that floor is already more than the budget. A summary of the
+#: first twenty turns is worth more than a garbled thirty-first, because by then
+#: what a turn said is far less important than that work happened at all.
+#:
+#: Measured: 26 turns graded by age came to 8,893 characters against a 3,000 cap;
+#: capped at 12 turns it is 4,272; at 8 it is ~2,900 and fits. Truncating the
+#: list rather than the entries is the only thing that fits.
+DIGEST_MAX_TURNS = 8
+
+
+def _grade(index: int, total: int) -> float:
+    """Detail multiplier for the *index*-th of *total* condensed turns.
+
+    Linear from :data:`GRADE_OLDEST` at the oldest turn to :data:`GRADE_NEWEST`
+    at the newest, so the digest's size grows sub-linearly with the session
+    instead of tracking it one-for-one.
+    """
+    if total <= 1:
+        return GRADE_NEWEST
+    position = index / (total - 1)  # 0.0 = oldest, 1.0 = newest
+    return GRADE_OLDEST + (GRADE_NEWEST - GRADE_OLDEST) * position
 
 
 def _is_digest(message: dict[str, str]) -> bool:
@@ -109,18 +136,25 @@ class Turn:
             {"role": "assistant", "content": self.report},
         ]
 
-    def condensed(self) -> str:
+    def condensed(self, grade: float = GRADE_NEWEST) -> str:
         """A short stand-in for this turn.
 
         Rendered as prose rather than as data on purpose. The prompt is a
         transcript the model reads as a transcript; a Python ``repr`` in the
         middle of it -- which is exactly what jaz does to ``prior_turns`` --
         wastes characters and is harder to read than the same facts in English.
+
+        *grade* scales how much survives, from 1.0 for a nearly-current turn down
+        to :data:`GRADE_OLDEST` for an ancient one. See :func:`_grade`.
         """
-        task = _clip(self.task, TASK_HEAD_CHARS)
+        head = max(1, int(TASK_HEAD_CHARS * grade))
+        report_head = max(1, int(REPORT_HEAD_CHARS * grade))
+        report_tail = max(1, int(REPORT_TAIL_CHARS * grade))
+
+        task = _clip(self.task, head)
         if not self.report:
             return f"- asked: {task} (no report; the turn did not finish)"
-        body = _clip(self.report, REPORT_HEAD_CHARS, REPORT_TAIL_CHARS)
+        body = _clip(self.report, report_head, report_tail)
         return f"- asked: {task}\n  did: {body}"
 
 
@@ -181,10 +215,17 @@ class Context:
     A character budget rather than a turn count, because turn sizes vary by two
     orders of magnitude -- "run the tests" and a pasted stack trace are both one
     turn -- so a turn budget is not a cost budget.
+
+    The default budget is sized against real measurements rather than taste. A
+    verbatim window of four ordinary turns -- a ~60-character task and a
+    ~900-character report -- already occupies about 3,900 characters, so a 6,000
+    budget left no room for any history at all and the digest was dropped on
+    nearly every turn that had one. 12,000 comfortably holds the window plus a
+    digest, and against a 1M-token window it is still a rounding error.
     """
 
     #: Characters of context to send, across the digest and the verbatim turns.
-    budget: int = 6000
+    budget: int = 12000
     #: Verbatim turns kept at the tail. See :data:`RECENT_TURNS`.
     recent: int = RECENT_TURNS
     #: Every turn of the session, oldest first. Unbounded on purpose.
@@ -232,13 +273,28 @@ class Context:
         blocks: list[tuple[list[dict[str, str]], list[str]]] = []
 
         if older:
-            raw = self._cost([m for t in older for m in t.as_messages()])
+            # The digest describes the most recent slice of `older` and counts
+            # the rest, so `raw` is measured against the same slice. Comparing
+            # against all of `older` would credit the digest with savings it
+            # never made.
+            described = older[-DIGEST_MAX_TURNS:]
+            raw = self._cost([m for t in described for m in t.as_messages()])
             digest = [self._digest_message(older)]
-            # Condense only when it actually saves something. The fixed overhead
-            # of a digest -- its header, plus "asked:/did:" per turn -- exceeds
-            # the content of a short turn, so an unconditional digest would make
-            # every early conversation strictly worse than sending it whole.
-            if self._cost(digest) < raw * WORTHWHILE:
+            # Two independent reasons to skip the digest:
+            #
+            # * It does not pay for itself. Its fixed overhead -- the header,
+            #   plus "asked:/did:" per turn -- exceeds the content of a short
+            #   turn, so an unconditional digest would make every early
+            #   conversation strictly worse than sending it whole.
+            # * It does not fit. Left uncapped the digest grows with the
+            #   session and can end up larger than the budget it exists to fit
+            #   inside, at which point the newest turn -- the one being
+            #   continued -- is the thing that gets pushed out.
+            #
+            # In both cases the turns go through as verbatim blocks instead, and
+            # the budget is what decides how many survive. That is strictly
+            # better than a digest nobody can afford.
+            if self._cost(digest) < min(raw * WORTHWHILE, self.budget * DIGEST_FRACTION):
                 blocks.append((digest, ["condensed"] * len(older)))
             else:
                 for turn in older:
@@ -267,32 +323,52 @@ class Context:
     def _fit(
         self, blocks: list[tuple[list[dict[str, str]], list[str]]]
     ) -> tuple[list[dict[str, str]], Plan]:
-        """Drop whole blocks from the oldest end until the budget is met.
+        """Drop whole blocks until the budget is met, keeping the newest turns.
 
-        The last block is always kept, whatever it costs. That block is the
-        newest turn -- the one the model is being asked to continue -- and a
-        single turn can be an enormous paste that no budget could hold. Sending
-        it long is recoverable and visible; silently dropping or truncating the
-        current task is neither, so the budget yields instead.
+        Two rules, and the second is the subtle one.
+
+        * Blocks come off from the oldest end, so what survives is always a
+          contiguous run of the most recent turns. Nothing in the middle is
+          discarded while older history is kept -- that would produce a
+          transcript that starts mid-story with no indication of what came
+          before.
+
+        * When the budget still cannot be met, the *recent* turns go, not the
+          digest. Keeping one condensed line for thirty old turns while throwing
+          away the turn the user just finished is backwards: the recent turns
+          are the ones a follow-up refers to. So the digest is dropped first,
+          then the oldest recent turns, and only the newest turn is guaranteed.
+
+        The last block is always kept whatever it costs. A single turn can be an
+        enormous paste that no budget could hold, and truncating the current
+        task is worse than sending a long prompt: going over is visible and
+        recoverable, silently shortening the history is neither.
         """
-        states = [state for _, group in blocks for state in group]
-        offsets = [0]
-        for _, group in blocks:
-            offsets.append(offsets[-1] + len(group))
+        if not blocks:
+            return [], Plan(states=())
 
-        # Candidate tail lengths, from "everything" down to "the last block".
-        for kept in range(len(blocks), 0, -1):
-            messages = [m for block, _ in blocks[len(blocks) - kept :] for m in block]
-            if kept == 1 or self._cost(messages) <= self.budget:
-                dropped = offsets[len(blocks) - kept]
-                plan = Plan(
-                    states=tuple(["dropped"] * dropped + states[dropped:]),
-                    cost=self._cost(messages),
-                )
-                return messages, plan
+        # Candidate suffixes, longest first: keep everything, then drop the
+        # oldest block, then the next. What survives is always a contiguous run
+        # of the most recent turns -- nothing in the middle is discarded while
+        # older history is kept, which would produce a transcript that starts
+        # mid-story with no indication of what came before.
+        #
+        # The first block is the digest, so it goes first. Keeping one condensed
+        # line for thirty old turns while throwing away the turn the user just
+        # finished is backwards: the recent turns are the ones a follow-up
+        # refers to.
+        for start in range(len(blocks)):
+            kept = set(range(start, len(blocks)))
+            messages = [m for i in sorted(kept) for m in blocks[i][0]]
+            cost = self._cost(messages)
+            if cost <= self.budget or start == len(blocks) - 1:
+                marked: list[str] = []
+                for i, (_, group) in enumerate(blocks):
+                    marked.extend(group if i in kept else ["dropped"] * len(group))
+                return messages, Plan(states=tuple(marked), cost=cost)
 
-        # Unreachable: the loop always returns on its final iteration, where
-        # ``kept == 1``. Expressed so a future edit cannot fall off the end.
+        # Unreachable: the loop returns on its final iteration, where ``start``
+        # leaves only the newest block and the guarantee above takes over.
         return [], Plan(states=())
 
     def _digest_message(self, older: list[Turn]) -> dict[str, str]:
@@ -302,9 +378,25 @@ class Context:
         "these happened, then this happened next" instead of wading through
         uniformly-detailed entries whose entire purpose is that the detail is
         gone.
+
+        Only the most recent :data:`DIGEST_MAX_TURNS` are described. Anything
+        older is counted instead of summarised: there is a per-turn floor below
+        which a condensed turn stops being readable, so past a certain point the
+        only way to fit the budget is to stop describing turns one by one. The
+        count is not a compromise -- by then *that* the work happened is the fact
+        worth carrying, and the detail has long since stopped being actionable.
         """
-        lines = [f"[{len(older)} earlier turn(s), condensed]"]
-        lines.extend(turn.condensed() for turn in older)
+        described, elided = older[-DIGEST_MAX_TURNS:], older[:-DIGEST_MAX_TURNS]
+        total = len(described)
+
+        header = f"[{len(older)} earlier turn(s), condensed; oldest first, detail fades with age]"
+        lines = [header]
+        if elided:
+            lines.append(
+                f"- ({len(elided)} turn(s) before that, summarised to a count; "
+                "work was done but its detail is no longer recoverable)"
+            )
+        lines.extend(turn.condensed(_grade(i, total)) for i, turn in enumerate(described))
         return {"role": "user", "content": f"{DIGEST_HEADER}\n\n" + "\n".join(lines)}
 
     @staticmethod

@@ -62,7 +62,7 @@ class Backend:
         """Return *model* in litellm's provider-prefixed form.
 
         A model that already carries the prefix is returned unchanged, so
-        ``/model openrouter/foo`` and ``/model foo`` mean the same thing.
+        ``/switchmodules openrouter/foo`` and ``/switchmodules foo`` mean the same thing.
         """
         model = model.strip()
         if not model:
@@ -127,7 +127,7 @@ class Backend:
 
 
 #: The backends on offer. OpenRouter is first because it is the default; the
-#: rest exist so ``/model`` is useful without reconfiguring anything.
+#: rest exist so ``/switchmodules`` is useful without reconfiguring anything.
 BACKENDS: dict[str, Backend] = {
     b.name: b
     for b in (
@@ -189,7 +189,7 @@ def resolve_backend(name: str | None) -> Backend:
 
 
 def available_backends() -> list[tuple[str, bool]]:
-    """``(name, has_key)`` for every backend, for the ``/model`` menu."""
+    """``(name, has_key)`` for every backend, for ``/backends``."""
     return [(name, backend.has_key()) for name, backend in BACKENDS.items()]
 
 

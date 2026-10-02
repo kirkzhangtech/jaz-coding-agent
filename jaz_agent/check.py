@@ -30,7 +30,7 @@ def main() -> int:
     print("config   : ok (api key found)")
     print(f"workspace: {ROOT}\n")
 
-    # Show what /model would offer, since that is the next thing a user asks.
+    # Show what /switchmodules would offer, since that is the next thing a user asks.
     models = list_models(resolve_backend(None))
     print(f"models   : {len(models)} available on this backend, e.g. {', '.join(models[:3])}\n")
 

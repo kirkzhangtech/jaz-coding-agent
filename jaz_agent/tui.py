@@ -15,27 +15,99 @@ from __future__ import annotations
 
 import threading
 import time
+from bisect import bisect_left, bisect_right
 from pathlib import Path
 from typing import Callable
 
+from rich.markup import escape
 from textual.app import App, ComposeResult
 from textual.binding import Binding
 from textual.containers import Horizontal
+from textual.message import Message
 from textual.reactive import reactive
 from textual.suggester import Suggester
 from textual.widgets import Footer, Header, Input, RichLog, Static
 
 from .bridge import Event, Kind, QueueDrain
-from .commands import COMMANDS, complete, find, help_text, hint_text
-from .llm_config import (
-    LLMConfigError,
-    available_backends,
-    describe_model,
-    list_models,
-    resolve_backend,
+from .commands import (
+    COMMANDS,
+    RETIRED,
+    Candidate,
+    candidates,
+    complete,
+    find,
+    help_text,
+    hint_text,
+    picker_rows,
 )
+from .context import report as context_report
+from .llm_config import available_backends, describe_model, list_models
 from .session import AgentSession
 from .tools import ROOT, tool_catalog
+
+
+class PromptInput(Input):
+    """The prompt box, with Tab bound to completion and ↑/↓ to the hint list.
+
+    Textual 8's ``Input`` has **no** Tab binding: a suggestion is accepted with
+    the right-arrow key, which is right for a single-line text field and wrong
+    for a command prompt. ``Screen`` claims Tab for ``app.focus_next``, so
+    before this existed Tab moved focus off the prompt and completed nothing.
+
+    The arrow keys are bound here too, but only to forward to the app: the hint
+    list is the app's state, and ``Input`` is the only widget that sees the key
+    press first. The app turns the message into a move, or -- when no list is
+    open -- back into cursor movement, so ordinary task text still gets working
+    arrow keys rather than nothing.
+    """
+
+    BINDINGS = [
+        *Input.BINDINGS,
+        Binding("tab", "accept_completion", "Accept completion", show=False),
+        Binding("up", "hint_up", "Previous suggestion", show=False),
+        Binding("down", "hint_down", "Next suggestion", show=False),
+        Binding("escape", "dismiss_hint", "Dismiss hint", show=False),
+    ]
+
+    #: Sent to the app, which owns the list and the selection index.
+    class Navigate(Message):
+        """↑ or ↓ was pressed in the prompt."""
+
+        def __init__(self, direction: int) -> None:
+            super().__init__()
+            self.direction = direction
+
+    class Dismiss(Message):
+        """Escape was pressed in the prompt."""
+
+    def action_accept_completion(self) -> None:
+        """Apply the pending suggestion, or do nothing.
+
+        Deliberately not ``cursor_right``: that action moves the cursor when
+        there is no suggestion, so Tab on ordinary task text would nudge the
+        caret one character along for no visible reason. Tab means "complete",
+        and when there is nothing to complete it should be inert.
+        """
+        suggestion = self._suggestion
+        if suggestion and len(suggestion) > len(self.value):
+            self.value = suggestion
+            self.cursor_position = len(self.value)
+
+    def action_hint_up(self) -> None:
+        self.post_message(self.Navigate(-1))
+
+    def action_hint_down(self) -> None:
+        self.post_message(self.Navigate(1))
+
+    def action_dismiss_hint(self) -> None:
+        """Close the hint without touching what was typed.
+
+        The list is a convenience, not a modal: Escape has to leave the prompt
+        exactly as it was, because the user may simply want the space back after
+        a stray ``/``. Without this the only way to dismiss it was to keep
+        typing or submit something.
+        """
+        self.post_message(self.Dismiss())
 
 
 class CommandSuggester(Suggester):
@@ -44,7 +116,7 @@ class CommandSuggester(Suggester):
     Two levels, because the useful completion changes with what has been typed:
 
     * ``/mo`` → ``model``
-    * ``/model openai/gpt-5-mini`` → completes to the full id in the catalogue
+    * ``/switchmodules openai/gpt-5-mini`` → completes to the full id
 
     The model half needs a catalogue, which is a network call. It is fetched in
     the background by the app and seeded through :meth:`load_models`; nothing
@@ -154,11 +226,19 @@ Screen {
     background: $panel;
 }
 
-/* The inline hint: one line under the prompt, shown only while typing a
-   slash command. Collapses to nothing (display: none) otherwise so it does not
-   leave a gap in the layout. */
+/* The picker: a fixed-height scrolling viewport under the prompt.
+
+   `height: auto` was wrong for anything long. The command list is at most ten
+   rows, but the model browser is OpenRouter's 464, and a list that grows to
+   464 lines pushes the transcript off the screen entirely -- there was no
+   way to see the agent while browsing.
+
+   A fixed viewport with `overflow-y: auto` keeps the layout stable and lets
+   the list scroll. Only the visible window is rendered, so moving through
+   hundreds of rows costs the same as moving through ten. */
 #hint {
-    height: auto;
+    height: 20;
+    overflow-y: auto;
     padding: 0 1;
     color: $text-accent;
     display: none;
@@ -199,6 +279,22 @@ def _subsequence(needle: str, haystack: str) -> bool:
     """
     it = iter(haystack)
     return all(char in it for char in needle)
+
+
+def _row_offsets(rows: list[Candidate]) -> list[int]:
+    """The display line at which each row starts.
+
+    Rows vary in height -- a command whose summary wraps occupies two lines --
+    so a scrolling window has to be measured in lines while the selection is
+    tracked in rows. Measuring the window in rows instead would scroll by the
+    wrong amount and drift further off the longer the list gets.
+    """
+    offsets: list[int] = []
+    line = 0
+    for row in rows:
+        offsets.append(line)
+        line += row.height
+    return offsets
 
 
 class Transcript(RichLog):
@@ -276,9 +372,12 @@ class CodingAgentApp(App[None]):
     """A TUI coding agent backed by jaz and OpenRouter's Space Bunny Alpha."""
 
     CSS = CSS
-    # Dropping a session is ``/new``. It used to also be F2, but a bare function
-    # key that clears your conversation is not discoverable and not reversible,
-    # and the command is listed in ``/help`` while a function key is not.
+    # ``/new`` is the way to drop a session. It was also F2, which made two
+    # ways to reach one action: one listed in ``/help`` and the inline hint, one
+    # only in the footer. The command is the discoverable path, so the key is
+    # gone rather than kept as a shortcut nobody finds. ``/cancel`` and
+    # ``/clear`` are bound for the same reason -- a key you have to remember
+    # while mid-turn is worse than typing two characters.
     BINDINGS = [
         Binding("ctrl+q", "quit", "Quit", priority=True),
         Binding("ctrl+c", "cancel", "Cancel"),
@@ -300,6 +399,22 @@ class CodingAgentApp(App[None]):
         self.started = time.monotonic()
         self._pending_prompt = prompt
         self._busy_since: float | None = None
+        #: Rows the ↑/↓ keys can move over, and which one is selected.
+        self._candidates: list[Candidate] = []
+        self._selected = 0
+        #: Set by Escape; cleared on the next edit, so the list is dismissible
+        #: for the current value rather than for the rest of the session.
+        self._hint_dismissed = False
+        #: What Enter does with the highlighted row: ``None`` for the slash
+        #: command list (the row is a command name), ``"model"`` for the model
+        #: browser (the row is a model id to switch to). One list, two owners --
+        #: the alternative is a second almost-identical widget and navigation
+        #: path, which is exactly the duplication that let the command list and
+        #: the browser drift apart before.
+        self._picker: str | None = None
+        #: Cached line offsets for the scrolling window; see :meth:`_offsets`.
+        self._offset_cache: list[int] | None = None
+        self._offset_source: list[Candidate] | None = None
 
     # -- layout ----------------------------------------------------------
 
@@ -313,7 +428,7 @@ class CodingAgentApp(App[None]):
         self.status = StatusBar(id="status")
         yield self.status
         with Horizontal(id="prompt"):
-            self.prompt_box = Input(
+            self.prompt_box = PromptInput(
                 placeholder="Describe a task, or / for commands",
                 id="task",
                 suggester=self.suggester,
@@ -349,7 +464,7 @@ class CodingAgentApp(App[None]):
     def _refresh_banner(self) -> None:
         """Redraw the header line.
 
-        Called on mount and after every successful ``/model`` switch, so the
+        Called on mount and after every successful switch, so the
         banner never claims a model the session is no longer using.
         """
         if self.banner is None:
@@ -449,6 +564,13 @@ class CodingAgentApp(App[None]):
         else:
             self._say(event.text, event.kind)
 
+        # A model list arrives as ids in the payload rather than as text, so the
+        # worker stays off the widgets and the rows become a navigable list here
+        # on the Textual thread.
+        models = event.payload.get("models")
+        if models:
+            self._open_model_picker(list(models))
+
     # -- the inline hint ---------------------------------------------------
 
     def on_input_changed(self, event: Input.Changed) -> None:
@@ -462,8 +584,22 @@ class CodingAgentApp(App[None]):
         if self.hint is None:
             return
 
+        # Any edit re-opens a list that Escape closed: the dismissal was about
+        # the value on screen, and the value is no longer the one dismissed.
+        self._hint_dismissed = False
+
         value = event.value
+
+        # The model browser owns the list, not the prompt. Typing while it is
+        # open means the user has decided to do something else, so the browser
+        # gets out of the way -- an empty value is not that: submitting the
+        # model list leaves the box empty, and a programmatic clear would
+        # otherwise be indistinguishable from the user starting a new task.
+        if self._picker == "model" and not value:
+            return
+
         if not value.startswith("/"):
+            self._clear_candidates()
             self.hint.display = False
             return
 
@@ -472,6 +608,9 @@ class CodingAgentApp(App[None]):
 
         if sep:
             # After the command name: hint about the argument, if it takes one.
+            # Nothing to navigate -- the argument is free text, or a model id
+            # with its own completion path.
+            self._clear_candidates()
             command = find(prefix)
             if command is None:
                 self._set_hint(f"unknown command /{prefix}", error=True)
@@ -482,29 +621,297 @@ class CodingAgentApp(App[None]):
             self._set_hint(f"{command.signature} — {command.summary}")
             return
 
-        self._set_hint(hint_text(prefix))
+        retired = self._retired_hint(prefix)
+        if retired:
+            self._clear_candidates()
+            self._set_hint(retired, error=True)
+            return
+
+        rows = candidates(prefix, self._hint_width())
+        self._candidates = rows
+        # A fresh list starts at the top. Keeping the old index would point at
+        # an unrelated row as soon as the prefix narrowed the list.
+        self._selected = 0
+        if rows and not self._hint_dismissed:
+            self._render_candidates()
+        else:
+            self._set_hint(hint_text(prefix, self._hint_width()))
+
+        self._set_hint(hint_text(prefix, self._hint_width()))
+
+    def _retired_hint(self, prefix: str) -> str | None:
+        """A redirect for a command that used to exist, if *prefix* names one."""
+        replacement = RETIRED.get(prefix.lower())
+        return f"/{prefix} is gone — use /{replacement}" if replacement else None
+
+    def _hint_width(self) -> int:
+        """Usable columns for the hint.
+
+        The screen width is the best available proxy, minus the border the
+        prompt draws around this area. ``on_input_changed`` only fires once the
+        app is running, so ``screen`` is always mounted here; the guard is for
+        a headless render with no terminal geometry rather than a real case.
+        """
+        size = getattr(self.screen, "size", None)
+        if size is None or not size.width:
+            return 80
+        return max(40, size.width - 2)
 
     def _set_hint(self, text: str, *, error: bool = False) -> None:
-        """Show one line of hint text, styled as an error when appropriate."""
+        """Show one line of hint text, styled as an error when appropriate.
+
+        The text is passed to ``Static.update`` as *markup*, so square brackets
+        in it are read as Rich tags. That silently mangled every usage string:
+        ``/switchmodules [model]`` rendered as ``/switchmodules`` with the
+        argument shape gone, and the model completion for that command was
+        undiscoverable. The text is escaped first and the style added around
+        the result, so the message can contain brackets safely.
+        """
         if self.hint is None:
             return
         self.hint.display = True
-        self.hint.update(f"[red]{text}[/]" if error else text)
+        body = escape(text)
+        self.hint.update(f"[red]{body}[/]" if error else body)
+
+    def _render_candidates(self) -> None:
+        """Draw the picker, showing only the lines around the selection.
+
+        Windowed rather than rendering every row. OpenRouter returns 464 ids,
+        and writing them all into the widget pushed the transcript off the
+        screen -- there was no way to watch the agent while browsing -- and the
+        first twenty were the only ones reachable at all.
+
+        The window follows the cursor, so ↓ walks the whole catalogue and the
+        list scrolls the way a scrolling list should, with no separate "next
+        page" concept to learn. Cost is the same at row 400 as at row 1.
+
+        Rows are never split across the window edge. A half-visible highlighted
+        row reads as a rendering bug rather than as a row that continues.
+        """
+        if self.hint is None or not self._candidates:
+            return
+
+        offsets = self._offsets()
+        viewport = self._picker_viewport()
+
+        first, last = self._window(offsets, viewport)
+        blocks: list[str] = []
+        for index in range(first, last + 1):
+            candidate = self._candidates[index]
+            body = escape("\n".join(candidate.lines)) if candidate.lines else ""
+            marker = "▸" if index == self._selected else " "
+            style = "[reverse bold]" if index == self._selected else ""
+            close = "[/]" if style else ""
+            blocks.append(f"{style}{marker}{body}{close}")
+
+        verb = "switch" if self._picker == "model" else "run"
+        total = len(self._candidates)
+        position = f"[dim] {first + 1}-{last + 1} of {total}[/]"
+        self.hint.display = True
+        self.hint.update(
+            "\n".join(
+                [
+                    *blocks,
+                    position,
+                    f"[dim]↑/↓ choose · Enter {verb} · Esc dismiss[/]",
+                ]
+            )
+        )
+
+    def _picker_viewport(self) -> int:
+        """How many lines of rows the picker can show.
+
+        Two lines are reserved for the position line and the key hint so they
+        stay put while the list scrolls behind them. The floor matters: before
+        the first layout pass ``size.height`` can be small or zero, and a
+        three-row viewport that then jumps to eighteen as the terminal settles
+        would make the list appear to scroll on its own.
+        """
+        if self.hint is None:
+            return 12
+        return max(10, self.hint.size.height - 2)
+
+    def _offsets(self) -> list[int]:
+        """Display line of each row's start, cached against the row list.
+
+        Recomputing on every keystroke is cheap for ten commands and wasteful
+        for 464 models, and the answer only changes when the list does. The
+        cache is keyed on the *identity* of the row list rather than its
+        length: two different lists can easily be the same length, and reusing
+        the wrong offsets would scroll the window to an arbitrary place.
+        """
+        rows = self._candidates
+        if self._offset_cache is None or self._offset_source is not rows:
+            self._offset_cache = _row_offsets(rows)
+            self._offset_source = rows
+        return self._offset_cache
+
+    def _window(self, offsets: list[int], viewport: int) -> tuple[int, int]:
+        """The inclusive row range to draw, chosen to contain the selection.
+
+        The selection is aimed about a third of the way down rather than glued
+        to an edge, so ↓ shows what is coming instead of only what was passed.
+
+        Binary search rather than a scan: the offsets are sorted, and a linear
+        walk over 464 rows on every keystroke is exactly the kind of thing that
+        makes a list feel sluggish. ``bisect_right`` finds the row whose start
+        is at or after the desired top edge directly.
+        """
+        sel_line = offsets[self._selected]
+        desired = max(0, sel_line - viewport // 3)
+
+        first = bisect_right(offsets, desired) - 1
+        # The row before the boundary may still be the one that contains the
+        # top edge, since a row can span several lines.
+        if first > 0 and offsets[first] > desired:
+            first -= 1
+        first = max(0, min(first, len(offsets) - 1))
+
+        limit = offsets[first] + viewport
+        # The last row is the one starting before the limit; walk back one to
+        # include whichever row actually straddles it.
+        last = bisect_left(offsets, limit) - 1
+        if last < first:
+            last = first
+        last = min(last, len(offsets) - 1)
+        return first, last
+
+    def _open_model_picker(self, models: list[str]) -> None:
+        """Turn a fetched model page into the navigable list.
+
+        Starts on the current model rather than row 0. The alternative is worse
+        than a preference: ↓ followed by Enter is the natural way to pick "the
+        one after this one", and if the list opens on ``aion-labs/aion-2.0``
+        while the session is on ``stealth/space-bunny-alpha``, the first ↓ picks
+        a model the user was not looking at and Enter switches to it.
+        """
+        if not models or self.hint is None:
+            return
+        current = self.session.model
+        marks = {m: ("✓" if m == current else " ") for m in models}
+        self._candidates = picker_rows(models, marks=marks)
+        self._picker = "model"
+        self._selected = models.index(current) if current in models else 0
+        self._render_candidates()
+
+    def _select_model(self, model: str) -> None:
+        """Switch to *model*, on a worker, through the same validated path.
+
+        Routed back through ``/switchmodules <model>`` rather than applied
+        directly so that the live probe, the "not switched" wording and the
+        catalogue-rejected case are exactly the ones the typed command gets.
+        Two paths to the same switch would drift, and the probe is the part that
+        must not be skipped.
+        """
+        self._say(f"switching to {model} …", Kind.THINKING)
+        threading.Thread(
+            target=self._try_switch_then_filter,
+            args=(model,),
+            name="jaz-switch-try",
+            daemon=True,
+        ).start()
+
+    def _clear_candidates(self) -> None:
+        """Drop the navigable rows. Called whenever the list cannot apply."""
+        self._candidates = []
+        self._selected = 0
+        self._picker = None
+        self._offset_cache = None
+        self._offset_source = None
+
+    def _move_selection(self, direction: int) -> bool:
+        """Move the highlight, wrapping at both ends. True if it moved.
+
+        Wrapping rather than clamping: the list is short and every row is a
+        real command, so there is nothing to gain from a dead end at the top or
+        bottom. Clamping would make pressing ↑ at the first row look like a
+        dropped keypress.
+        """
+        if not self._candidates:
+            return False
+        count = len(self._candidates)
+        self._selected = (self._selected + direction) % count
+        self._render_candidates()
+        return True
+
+    def on_prompt_input_navigate(self, event: PromptInput.Navigate) -> None:
+        """Move the hint selection, or fall through to cursor movement.
+
+        The prompt owns the key press but not the list, so the decision lives
+        here. When no list is open the key is handed back to the input, because
+        swallowing ↑/↓ on ordinary task text would leave no way to move the
+        caret back over text that was mistyped.
+        """
+        if self._move_selection(event.direction):
+            event.stop()
+            return
+        assert self.prompt_box is not None
+        if event.direction < 0:
+            self.prompt_box.action_cursor_left()
+        else:
+            self.prompt_box.action_cursor_right()
+
+    def on_prompt_input_dismiss(self, event: PromptInput.Dismiss) -> None:
+        """Close the hint, leaving the typed text alone.
+
+        Escape closes it until the value changes again. That is the useful
+        behaviour for "I typed ``/`` by accident" -- the list returns on the
+        next keystroke, so nothing is permanently lost and nothing has to be
+        retyped.
+        """
+        self._hint_dismissed = True
+        self._hide_hint()
 
     def _hide_hint(self) -> None:
         """Collapse the hint. Called when a command is submitted."""
+        self._clear_candidates()
         if self.hint is not None:
             self.hint.display = False
 
     # -- input handling --------------------------------------------------
 
     async def on_input_submitted(self, event: Input.Submitted) -> None:
-        """Handle a submitted prompt: slash commands, else start a turn."""
+        """Handle a submitted prompt: slash commands, else start a turn.
+
+        A highlighted row wins over whatever was typed, and what it *means*
+        depends on which list is open: a command name to run, or a model id to
+        switch to. Pressing ↓ and Enter is how every shell completion menu
+        works, and treating the highlight as decoration would make it a lie.
+
+        The two lists gate the highlight differently, and both gates are needed:
+
+        * For the command list, only a row the user actually moved to counts.
+          The selection sits at row 0 and the list appears the instant a slash
+          is typed, so "a row is highlighted" is true from the first keystroke.
+          Without the gate, an untouched ``/s`` would submit as ``/status``.
+        * For the model browser, row 0 is always the right answer. The list was
+          opened deliberately, it opens on the current model, and there may be
+          only one row -- a one-item list has no row to move to, so a "did the
+          user move?" gate would make it impossible to use.
+        """
         text = event.value.strip()
+
+        if self._picker == "model" and self._candidates:
+            # A model id in the prompt is not a task and not a command; it can
+            # only mean "switch to this". The browser owns the switch, including
+            # the live probe, so the row is routed back through it rather than
+            # being applied here.
+            event.input.value = ""
+            chosen = self._candidates[self._selected].name
+            self._hide_hint()
+            self._select_model(chosen)
+            return
+
+        chosen = self._chosen_candidate()
+
         if not text:
             self._hide_hint()
             return
         event.input.value = ""
+
+        if chosen is not None:
+            text = chosen
+
         self._hide_hint()
 
         if text.startswith("/"):
@@ -513,6 +920,17 @@ class CodingAgentApp(App[None]):
 
         self._say(f"› {text}", Kind.STATUS)
         self._send(text)
+
+    def _chosen_candidate(self) -> str | None:
+        """The name of the moved-to row, or ``None`` if the list is untouched.
+
+        The bare name (``/switchmodules``) rather than the signature
+        (``/switchmodules [model]``): the argument is the user's to type, and
+        submitting the placeholder would be rejected as an unknown command.
+        """
+        if not self._candidates or self._selected == 0:
+            return None
+        return self._candidates[self._selected].name
 
     def _send(self, text: str) -> None:
         """Kick off a background turn, rolling the session over if needed."""
@@ -538,6 +956,17 @@ class CodingAgentApp(App[None]):
 
         command = find(name)
         if command is None:
+            replacement = RETIRED.get(name.lower())
+            if replacement:
+                # A command that used to exist is a different failure from a
+                # typo: the user knows exactly what they typed and is being told
+                # no. Point them at what replaced it rather than making them
+                # read /help to find out.
+                self._say(
+                    f"/{name} is gone — use /{replacement}",
+                    Kind.ERROR,
+                )
+                return
             suggestion = self._closest(name)
             extra = f" — did you mean /{suggestion}?" if suggestion else ""
             self._say(f"unknown command /{name}{extra} — /help lists them all", Kind.ERROR)
@@ -548,11 +977,12 @@ class CodingAgentApp(App[None]):
             "help": lambda: self._say(help_text(), Kind.STATUS),
             "status": self._show_status,
             "clear": self.action_clear,
-            "new": self.action_new_session,
-            "cancel": self.session.cancel,
+            "new": self.action_new,
+            "cancel": self.action_cancel,
+            "cost": self.action_cost,
+            "context": self.action_context,
             "backends": self.action_backends,
             "switchmodules": lambda: self.action_switch_modules(rest),
-            "model": lambda: self.action_model(rest),
         }.get(command.name)
 
         if handler is None:
@@ -585,18 +1015,20 @@ class CodingAgentApp(App[None]):
 
     # -- model switching --------------------------------------------------
 
-    #: How many models one page of ``/switchmodules`` shows. Small enough to fit
-    #: a screen without scrolling the transcript into uselessness.
-    MODEL_PAGE_SIZE = 20
+    #: How many rows the picker's viewport shows, and therefore how many the
+    #: window draws. Was a hard cap on the *data* too, which is what made the
+    #: other 444 rows unreachable; now it is only a window size and the list
+    #: scrolls. Kept as a constant because it is a layout decision rather than a
+    #: number the code depends on, and the tests assert against it.
+    MODEL_PAGE_SIZE = 18
 
     def action_switch_modules(self, argument: str = "") -> None:
         """``/switchmodules`` — browse and switch models on the current backend.
 
-        Without an argument this lists the catalogue; with one it switches, the
-        same as ``/model <name>``. The argument accepts a filter, so
-        ``/switchmodules gpt-5`` narrows the list rather than jumping straight
-        to a switch — OpenRouter currently offers 463 models, so an unfiltered
-        dump would be unreadable.
+        Without an argument this lists the catalogue; with one it switches. The
+        argument accepts a filter, so ``/switchmodules gpt-5`` narrows the list
+        rather than jumping straight to a switch — OpenRouter currently offers
+        463 models, so an unfiltered dump would be unreadable.
 
         The list is fetched on a worker: it is a network call, and OpenRouter's
         catalogue can be slow.
@@ -609,8 +1041,8 @@ class CodingAgentApp(App[None]):
         # the filter path instead, with nothing committed.
         #
         # The switch attempt has to be distinguished from a *successful* one, and
-        # ``_switch_worker`` reports failures by emitting rather than by raising,
-        # so the decision is made here on the session state, not on an exception.
+        # a worker reports failures by emitting rather than by raising, so the
+        # decision is made here on the session state, not on an exception.
         if query:
             threading.Thread(
                 target=self._try_switch_then_filter,
@@ -688,10 +1120,16 @@ class CodingAgentApp(App[None]):
         self._emit_models(models, query)
 
     def _emit_models(self, models: list[str], query: str = "") -> None:
-        """Filter, page and emit a model list. Shared by browse and fall-back.
+        """Filter, then hand the whole result set to the UI thread.
 
-        Split out from the worker so the "not a model, here is what matches"
-        path and the plain ``/switchmodules`` path cannot format differently.
+        Shared by the browse path and the "that was not a model, here is what
+        matches" fall-back, so the two cannot format differently.
+
+        Nothing is truncated here. This used to take the first twenty and print
+        "and 443 more", which was not pagination -- the other 444 rows had no
+        way to be reached at all, by arrow or by command. The picker scrolls
+        instead, so the whole set goes across and the viewport decides what is
+        visible.
         """
         backend = self.session.backend
 
@@ -699,7 +1137,7 @@ class CodingAgentApp(App[None]):
             self.session.bridge.emit(
                 Kind.ERROR,
                 f"no models available from {backend.name}; check the network, "
-                f"or name a model directly with /model <name>",
+                f"or name a model directly with /switchmodules <model>",
             )
             return
 
@@ -719,29 +1157,27 @@ class CodingAgentApp(App[None]):
             )
             return
 
-        shown = models[: self.MODEL_PAGE_SIZE]
-        header = f"{len(models)} model(s) on {backend.name}"
+        total = len(models)
+        header = f"{total} model(s) on {backend.name}"
         if query:
             header += f" matching {query!r}"
 
         current = self.session.model
         lines = [f"{header}:"]
 
-        # When browsing the whole catalogue, page alphabetically but state the
-        # current model up front. OpenRouter lists 463 ids sorted, and a model
-        # like `stealth/space-bunny-alpha` sits at position ~420 -- so an
-        # alphabetical first page can leave the one model the user is actually
-        # on off-screen entirely. A filter is different: if the current model
-        # matched, it is already in the result set.
-        if not query and current not in shown:
-            lines.append(f" ✓ {current}   ← current")
+        # Open on the current model. With 464 ids sorted it is near the end, so
+        # starting at row 0 would mean ↓ picks a model the user was not looking
+        # at. The picker scrolls to it; when the model was filtered out of the
+        # result set there is nothing to scroll to, so say which one is live.
+        if query and current not in models:
+            lines.append(f" current: {current}  (not in these results)")
 
-        lines.extend(f" {'✓' if m == current else ' '} {m}" for m in shown)
-        if len(models) > len(shown):
-            lines.append(f" … and {len(models) - len(shown)} more")
-        lines.append("")
-        lines.append("switch with  /switchmodules <model>   or  /model <model>")
-        self.session.bridge.emit(Kind.STATUS, "\n".join(lines))
+        self.session.bridge.emit(
+            Kind.STATUS,
+            "\n".join(lines),
+            models=list(models),
+            current=current,
+        )
 
     def action_backends(self) -> None:
         """List the configured backends and whether each has a key."""
@@ -751,81 +1187,6 @@ class CodingAgentApp(App[None]):
             current = " (current)" if name == self.session.backend.name else ""
             rows.append(f"{mark} {name:12s}{current}")
         self._say("backends:\n" + "\n".join(rows), Kind.STATUS)
-
-    def action_model(self, argument: str) -> None:
-        """``/model`` shows the current model, ``/model <name>`` switches.
-
-        With no argument this lists what the current backend offers rather than
-        printing just the name: the useful answer to "which model am I on" also
-        answers "what else could I pick".
-
-        Three forms are accepted, resolved here so ``switch_model`` stays a plain
-        setter with one meaning:
-
-        * ``/model <model>``            -- same backend, named model
-        * ``/model <backend>``          -- that provider, its default model
-        * ``/model <backend> <model>``  -- both
-        """
-        if not argument:
-            self._say(self._model_menu(), Kind.STATUS)
-            return
-
-        parts = argument.split()
-        if len(parts) == 1:
-            # A single word is a model id unless it names a backend, in which
-            # case the user means "move to that provider". An empty model is
-            # passed through as-is: switch_model resolves the backend's default,
-            # so the TUI does not need its own copy of that rule.
-            try:
-                resolve_backend(parts[0])
-            except LLMConfigError:
-                backend_name, model_name = None, parts[0]
-            else:
-                backend_name, model_name = parts[0], ""
-        else:
-            backend_name, model_name = parts[0], " ".join(parts[1:])
-
-        label = model_name or f"{backend_name} default"
-        self._say(f"switching to {label} …", Kind.THINKING)
-        # The probe is a live network call, so it runs on a worker and reports
-        # back through the same queue as the agent's events.
-        threading.Thread(
-            target=self._switch_worker,
-            args=(backend_name, model_name),
-            name="jaz-switch",
-            daemon=True,
-        ).start()
-
-    def _switch_worker(self, backend_name: str | None, model_name: str) -> None:
-        """Body of the switch thread: probe, then commit or report.
-
-        Runs off the UI thread because the probe is a live network call. It must
-        therefore not touch a widget -- results go onto the agent's queue as
-        events and are rendered by the same drain as everything else. The
-        ``banner`` flag rides along because a committed switch changes the
-        header, and only the UI thread may redraw that.
-        """
-        try:
-            note = self.session.switch_model(model_name or None, backend=backend_name)
-        except LLMConfigError as exc:
-            # The old model is still in force. Say so explicitly: "it did not
-            # switch" and "it switched and then failed" mean very different
-            # things to the user.
-            self.session.bridge.emit(Kind.ERROR, f"not switched — {exc}")
-        except Exception as exc:  # never let a switch kill the UI
-            self.session.bridge.emit(Kind.ERROR, f"not switched — {type(exc).__name__}: {exc}")
-        else:
-            # The cached model ids belong to the old backend; drop them so Tab
-            # does not offer models the new provider does not have.
-            self.suggester.invalidate()
-            self.session.bridge.emit(Kind.RESULT, note, redraw_banner=True)
-            # Warm the new backend's catalogue so Tab completion works straight
-            # away rather than after the user's first /model attempt.
-            threading.Thread(
-                target=self._warm_suggester,
-                name="jaz-models-warm",
-                daemon=True,
-            ).start()
 
     def _warm_suggester(self) -> None:
         """Fetch the current backend's models for the completion cache.
@@ -838,30 +1199,6 @@ class CodingAgentApp(App[None]):
         except Exception:
             pass
 
-    def _model_menu(self) -> str:
-        """Current model plus alternatives, for the no-argument ``/model``."""
-        session = self.session
-        lines = [f"current: {session.model_name}"]
-
-        models = list_models(session.backend)
-        others = [m for m in models if m != session.model]
-        if others:
-            lines.append("")
-            lines.append(f"available on {session.backend.name} (showing {min(8, len(others))}):")
-            lines.extend(f"  {m}" for m in others[:8])
-            if len(others) > 8:
-                lines.append(f"  … and {len(others) - 8} more")
-        else:
-            lines.append("")
-            lines.append("model discovery unavailable; type a model id directly")
-
-        lines.append("")
-        lines.append("  /model <name>            switch model")
-        lines.append("  /model <backend> <model>  switch backend and model")
-        lines.append("  /model <backend>         switch backend, keep its default model")
-        lines.append("  /backends                list backends and their keys")
-        return "\n".join(lines)
-
     # -- actions ---------------------------------------------------------
 
     def action_clear(self) -> None:
@@ -869,12 +1206,12 @@ class CodingAgentApp(App[None]):
         if self.transcript:
             self.transcript.clear()
 
-    def action_new_session(self) -> None:
+    def action_new(self) -> None:
         """Drop conversation history so the next turn starts cold."""
         if self.session.busy:
             self._say("busy — cancel the current turn first", Kind.ERROR)
             return
-        self.session.history.clear()
+        self.session.context.clear()
         self.session.bridge.iterations = 0
         self.session.bridge.started = time.monotonic()
         if self.status:
@@ -897,6 +1234,14 @@ class CodingAgentApp(App[None]):
             f"turns: {bridge.iterations} · cost: ${bridge.total_cost:.4f} · elapsed: {self.status.elapsed if self.status else '0:00'}",
             Kind.COST,
         )
+
+    def action_context(self) -> None:
+        """Show what the session remembers and what the next turn will send.
+
+        Safe to render raw: the transcript runs with ``markup=False``, so the
+        square brackets in the turn list cannot be read as Rich tags.
+        """
+        self._say(context_report(self.session.context), Kind.STATUS)
 
 
 def run_tui(session: AgentSession | None = None, prompt: str | None = None) -> None:

@@ -28,6 +28,7 @@ from jaz.hooks import FileLogger, IterationLimit
 from jaz.repl.python_repl import PythonREPL
 
 from .bridge import EventBridge, Kind
+from .context import Context
 from .llm_config import (
     LLMConfigError,
     build_llm,
@@ -120,7 +121,7 @@ class AgentSession:
         self._llm = llm
 
         # The backend/model pair is session state rather than construction state,
-        # so /model can change it later. Resolved eagerly so a bad name or a
+        # so /switchmodules can change it later. Resolved eagerly so a bad name or a
         # missing key fails at startup rather than on the first turn.
         self.backend = resolve_backend(backend)
         self.model = self.backend.bare(model) if model else default_model_for(self.backend)
@@ -131,7 +132,7 @@ class AgentSession:
 
         self._thread: threading.Thread | None = None
         self._cancelled = threading.Event()
-        self.history: list[dict[str, str]] = []
+        self.context = Context()
         self.running = False
 
     # -- model selection -------------------------------------------------
@@ -226,7 +227,6 @@ class AgentSession:
 
         self._cancelled.clear()
         self.running = True
-        self.history.append({"role": "user", "content": user_input})
         self._thread = threading.Thread(
             target=self._run_turn,
             args=(user_input,),
@@ -251,15 +251,15 @@ class AgentSession:
     def _run_turn(self, user_input: str) -> None:
         """Body of the worker thread: run one invoke, translate the outcome."""
         try:
-            # Read the backend/model at turn start, not at construction: a /model
-            # switch between turns must take effect on the next one.
+            # Read the backend/model at turn start, not at construction: a
+            # /switchmodules switch between turns must take effect on the next one.
             llm = self._llm or build_llm(self.model, backend=self.backend.name)
             jaz.configure(
                 llm=llm,
                 repl=make_repl(self.workspace, exec_timeout=self.exec_timeout),
             )
 
-            prior = list(self.history[:-1])
+            prior = self.context.prompt()
 
             def finish(summary: str) -> str:
                 """Call this when the task is complete, passing a short markdown
@@ -279,7 +279,7 @@ class AgentSession:
             report = jaz.invoke(*self._turn_hooks(), **inputs)
 
             summary = report if isinstance(report, str) else str(report)
-            self.history.append({"role": "assistant", "content": summary})
+            self.context.add(user_input, summary)
             self.bridge.emit(Kind.RESULT, summary, final=True)
 
         except Exception as exc:  # the UI must survive any agent failure
@@ -303,9 +303,10 @@ class AgentSession:
         if self.running:
             raise RuntimeError("a turn is already in flight")
         self.running = True
-        self.history.append({"role": "user", "content": user_input})
         try:
             self._run_turn(user_input)
         finally:
             self.running = False
-        return self.history[-1]["content"] if len(self.history) > 1 else ""
+        if not self.context.turns:
+            return ""
+        return self.context.turns[-1].report

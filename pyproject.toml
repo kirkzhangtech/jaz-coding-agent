@@ -1,0 +1,48 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "jaz-agent"
+version = "0.1.0"
+description = "A TUI coding agent built on the jaz framework, using OpenRouter's Space Bunny Alpha."
+readme = "README.md"
+requires-python = ">=3.12"
+authors = [{ name = "kirkzhangtech" }]
+keywords = ["agent", "tui", "llm", "textual", "coding-agent"]
+classifiers = [
+  "Development Status :: 4 - Beta",
+  "Environment :: Console",
+  "Programming Language :: Python :: 3.12",
+  "Programming Language :: Python :: 3.13",
+  "Intended Audience :: Developers",
+  "Topic :: Software Development :: Code Generators",
+]
+# jaz is pinned exactly: it is an alpha, and the next patch may move APIs this
+# agent is written against. Relaxing it would push that breakage onto users.
+dependencies = [
+  "jaz-lang==0.2.0a4",
+  "textual>=8.0",
+]
+
+[project.optional-dependencies]
+# pytest is a development dependency, not a runtime one. requirements.txt
+# carries both, so the split has to be stated here or installing the package
+# drags a test framework into production.
+dev = ["pytest>=8.0"]
+
+[project.urls]
+Repository = "https://github.com/kirkzhangtech/jaz-coding-agent"
+Issues = "https://github.com/kirkzhangtech/jaz-coding-agent/issues"
+
+# Enables `jaz-agent` on PATH after an install, alongside `python -m jaz_agent`.
+[project.scripts]
+jaz-agent = "jaz_agent.__main__:main"
+
+[tool.hatch.build.targets.wheel]
+# Explicit rather than inferred: the tests/ directory sits next to the package
+# and would otherwise be ambiguous to the auto-detector.
+packages = ["jaz_agent"]
+
+[tool.hatch.build.targets.sdist]
+include = ["/jaz_agent", "/tests", "/README.md"]

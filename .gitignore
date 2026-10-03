@@ -9,6 +9,10 @@ venv/
 # jaz output
 *.log
 
+# build artifacts
+dist/
+build/
+*.egg-info/
 
 # local secrets
 .env

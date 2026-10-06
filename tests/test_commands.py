@@ -388,10 +388,16 @@ def test_hint_stacks_the_summary_when_narrow():
 
 
 def test_hint_wraps_a_summary_that_cannot_fit():
-    """A summary too long for the column is broken, not clipped."""
+    """A summary too long for the column is broken, not clipped.
+
+    Asserted against the longest summary in the table rather than against a
+    literal: editing a summary should not silently retire this check, which is
+    what happened the last time the text was reworded for a real reason.
+    """
+    longest = max(command.summary for command in COMMANDS)
     lines = hint_text("", 46).splitlines()
     joined = " ".join(line.strip() for line in lines)
-    assert "browse and switch models on the current backend" in joined
+    assert longest in joined, "the longest summary was clipped rather than wrapped"
 
 
 def test_hint_expands_the_only_match():
@@ -496,12 +502,22 @@ def test_candidates_expose_the_name_and_the_layout():
     """The keyboard navigation needs the name and the display form separately.
 
     They differ: ``name`` is ``/switchmodules`` and goes into the input box,
-    while ``signature`` is ``/switchmodules [model]`` and is only ever shown.
-    Collapsing them would submit the literal placeholder and be rejected.
+    while ``signature`` is ``/switchmodules [model|@backend]`` and is only ever
+    shown. Collapsing them would submit the literal placeholder and be rejected.
+
+    The expected signatures come from the table rather than from literals, so
+    that editing a usage string cannot quietly turn this into a test of nothing.
     """
     rows = candidates("/s", 120)
     assert [c.name for c in rows] == ["/status", "/switchmodules"]
-    assert [c.signature for c in rows] == ["/status", "/switchmodules [model]"]
+
+    for row in rows:
+        command = find(row.name)
+        assert command is not None, f"{row.name!r} is not a command"
+        assert row.signature == command.signature
+        # The whole point of carrying both: the shown form is not submittable.
+        assert row.signature != row.name, f"{row.name!r} lost its argument shape"
+
     assert all(c.summary for c in rows), "a row has no summary"
     assert all(c.lines for c in rows), "a row has no rendered text"
     # The rendered text must contain the signature, or the highlight would sit
@@ -582,6 +598,13 @@ def test_subsequence_filter_handles_missing_punctuation():
 
 
 def test_switchmodules_is_documented_as_taking_a_model():
-    """The usage string drives both the hint and the completions."""
+    """The usage string drives both the hint and the completions.
+
+    It must name the model form *and* the explicit-backend one: the second is
+    how a model on another provider is asked for, and it exists precisely
+    because the bare id cannot say which provider it means.
+    """
+    usage = find("switchmodules").usage
     assert "switchmodules" in MODEL_ARGUMENT
-    assert "[model]" in find("switchmodules").usage
+    assert "[model" in usage
+    assert "@backend" in usage

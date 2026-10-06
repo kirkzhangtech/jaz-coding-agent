@@ -391,6 +391,177 @@ def test_unknown_backend_lists_the_known_ones():
         resolve_backend("openruter")
 
 
+def test_deepseek_is_a_known_backend():
+    """DeepSeek is reachable by name, with its own prefix and key variable."""
+    from jaz_agent.llm_config import resolve_backend
+
+    backend = resolve_backend("deepseek")
+    assert backend.prefix == "deepseek"
+    assert backend.key_vars == ("DEEPSEEK_API_KEY",)
+    assert backend.route("deepseek-chat") == "deepseek/deepseek-chat"
+    # Defining the prefix twice must not double it, same as every other backend.
+    assert backend.route("deepseek/deepseek-chat") == "deepseek/deepseek-chat"
+    assert backend.bare("deepseek/deepseek-reasoner") == "deepseek-reasoner"
+
+
+def test_deepseek_builds_a_litellm_at_its_own_root(monkeypatch):
+    """The route must be routable and the base must not fall back to OpenRouter's."""
+    from jaz_agent.llm_config import build_llm, default_model_for, resolve_backend
+
+    monkeypatch.setenv("DEEPSEEK_API_KEY", "sk-ds-test")
+    monkeypatch.delenv("JAZ_API_BASE", raising=False)
+    monkeypatch.delenv("JAZ_MODEL", raising=False)
+
+    backend = resolve_backend("deepseek")
+    assert default_model_for(backend) == "deepseek-v4-pro"
+
+    llm = build_llm(backend="deepseek")
+    assert llm.model == "deepseek/deepseek-v4-pro"
+    assert llm.request_defaults["api_base"] == "https://api.deepseek.com/v1"
+
+
+def test_deepseek_requires_its_own_key(monkeypatch):
+    """A missing DeepSeek key names DEEPSEEK_API_KEY, not OpenRouter's."""
+    from jaz_agent.llm_config import LLMConfigError, build_llm
+
+    monkeypatch.delenv("DEEPSEEK_API_KEY", raising=False)
+    monkeypatch.setenv("OPENROUTER_API_KEY", "sk-or-test")
+
+    with pytest.raises(LLMConfigError, match="DEEPSEEK_API_KEY"):
+        build_llm(backend="deepseek")
+
+
+def test_available_backends_reports_deepseek(monkeypatch):
+    """``/backends`` must show DeepSeek, marked by its own key."""
+    import jaz_agent.llm_config as cfg
+
+    monkeypatch.setenv("DEEPSEEK_API_KEY", "sk-ds-test")
+
+    seen = dict(cfg.available_backends())
+    assert seen["deepseek"] is True
+
+    monkeypatch.delenv("DEEPSEEK_API_KEY", raising=False)
+    assert dict(cfg.available_backends())["deepseek"] is False
+
+
+def test_deepseek_well_known_lists_the_names_the_api_advertises():
+    """Only the advertised ids, not the legacy aliases that still resolve.
+
+    Captured from the live API. ``deepseek-chat`` and ``deepseek-reasoner``
+    still answer -- they are aliases -- but ``/models`` names only these two,
+    and a menu of undocumented aliases is a menu that cannot be checked against
+    anything. Rejection text, verbatim::
+
+        The supported API model names are deepseek-flash, deepseek-v4-pro,
+        but you passed deepseek-v4.1-flash.
+    """
+    from jaz_agent.llm_config import default_model_for, resolve_backend
+
+    backend = resolve_backend("deepseek")
+    assert set(backend.well_known) == {"deepseek-flash", "deepseek-v4-pro"}
+    assert default_model_for(backend) in backend.well_known
+
+
+def test_deepseek_models_come_from_the_live_catalogue(monkeypatch):
+    """A key lets us ask DeepSeek what it offers, as we already do OpenRouter."""
+    import jaz_agent.llm_config as cfg
+
+    monkeypatch.setattr(
+        cfg, "_list_deepseek_models", lambda backend: ["deepseek-v4-pro", "deepseek-flash"]
+    )
+    assert cfg.list_models(cfg.resolve_backend("deepseek")) == [
+        "deepseek-v4-pro",
+        "deepseek-flash",
+    ]
+
+
+def test_an_empty_or_keyless_live_catalogue_falls_back_to_well_known(monkeypatch):
+    """Offline, or with no key, the menu degrades -- it does not go blank."""
+    import jaz_agent.llm_config as cfg
+
+    monkeypatch.setattr(cfg, "_list_deepseek_models", lambda backend: [])
+    backend = cfg.resolve_backend("deepseek")
+    assert cfg.list_models(backend) == list(backend.well_known)
+
+
+def test_deepseek_discovery_needs_a_key_and_says_nothing_without_one(monkeypatch):
+    """``/models`` is keyed, so an unkeyed backend must not raise or call out."""
+    import jaz_agent.llm_config as cfg
+
+    monkeypatch.delenv("DEEPSEEK_API_KEY", raising=False)
+    assert cfg._list_deepseek_models(cfg.resolve_backend("deepseek")) == []
+
+
+# --------------------------------------------------------------------------
+# decoding a /switchmodules argument
+#
+# Pure, so it is checked here rather than through the TUI: the interesting
+# cases are all about what a string *means*, and none of them need a terminal.
+# --------------------------------------------------------------------------
+
+
+def test_switch_request_forms():
+    """The three shapes, and which one is a switch rather than a search."""
+    from jaz_agent.llm_config import parse_switch_request, resolve_backend
+
+    current = resolve_backend("openrouter")
+
+    browse = parse_switch_request("", current=current)
+    assert not browse.is_switch and browse.filter == ""
+
+    plain = parse_switch_request("gpt-5", current=current)
+    assert plain.is_switch and plain.model == "gpt-5" and plain.backend is None
+
+    named = parse_switch_request("deepseek", current=current)
+    assert named.is_switch and named.backend.name == "deepseek" and named.model is None
+
+    marked = parse_switch_request("@deepseek", current=current)
+    assert marked.is_switch and marked.backend.name == "deepseek" and marked.model is None
+
+    both = parse_switch_request("@deepseek deepseek-v4-pro", current=current)
+    assert both.is_switch and both.backend.name == "deepseek"
+    assert both.model == "deepseek-v4-pro"
+
+
+def test_a_vendor_prefixed_model_is_not_read_as_a_backend():
+    """The rule the whole syntax exists to avoid.
+
+    ``openai/gpt-5-mini`` is one of OpenRouter's models. "The prefix names the
+    backend" is the obvious rule and the wrong one: it would move existing
+    ``/switchmodules openai/gpt-5-mini`` onto the OpenAI backend and its key.
+    """
+    from jaz_agent.llm_config import parse_switch_request, resolve_backend
+
+    request = parse_switch_request("openai/gpt-5-mini", current=resolve_backend("openrouter"))
+    assert request.backend is None, "a model id was read as a provider name"
+    assert request.model == "openai/gpt-5-mini"
+
+
+def test_a_mistyped_backend_raises_and_lists_the_known_names():
+    """``@deapseak`` is a typo, not a search term."""
+    from jaz_agent.llm_config import LLMConfigError, parse_switch_request, resolve_backend
+
+    with pytest.raises(LLMConfigError, match="unknown backend"):
+        parse_switch_request("@deapseak x", current=resolve_backend("openrouter"))
+
+
+def test_naming_the_backend_you_are_on_means_its_default_model(monkeypatch):
+    """``/switchmodules openrouter`` reads as "put me back on the default".
+
+    It is the same sentence as naming any other backend, and the previous
+    version raised "no model given" for it -- an error for a request that has
+    an obvious meaning.
+    """
+    from jaz_agent.llm_config import BACKENDS, default_model_for
+
+    monkeypatch.setenv("OPENROUTER_API_KEY", "sk-or-test")
+    session = AgentSession(llm=MockLLMClient(fn=lambda *a, **k: "return 'x'"))
+
+    session.switch_model(None, backend="openrouter")
+
+    assert session.model == default_model_for(BACKENDS["openrouter"])
+
+
 def test_switch_model_commits_and_reports(monkeypatch):
     """A valid switch changes the session state and says so.
 
@@ -423,6 +594,22 @@ def test_switch_backend_and_model_together(monkeypatch):
     assert session.backend is BACKENDS["anthropic"]
     assert session.model == "claude-sonnet-4-5"
     assert session.model_name == "claude-sonnet-4-5 via anthropic"
+
+
+def test_switch_to_deepseek_stores_the_bare_id(monkeypatch):
+    """Switching providers to DeepSeek stores the bare id and reports it."""
+    from jaz_agent.llm_config import BACKENDS
+
+    monkeypatch.setenv("DEEPSEEK_API_KEY", "sk-ds-test")
+    session = AgentSession(llm=MockLLMClient(fn=lambda *a, **k: "return 'x'"))
+
+    session.switch_model("deepseek-flash", backend="deepseek")
+
+    assert session.backend is BACKENDS["deepseek"]
+    assert session.model == "deepseek-flash"
+    assert session.model_name == "deepseek-flash via deepseek"
+    # The prefix is added at build time, never stored.
+    assert BACKENDS["deepseek"].route(session.model) == "deepseek/deepseek-flash"
 
 
 def test_switch_strips_a_prefix_from_the_wrong_backend(monkeypatch):
@@ -469,6 +656,37 @@ def test_a_failed_probe_leaves_the_model_alone(monkeypatch):
 
     assert (session.backend.name, session.model) == before, "state changed on failure"
     assert calls, "probe was never called"
+
+
+def test_a_failed_probe_says_which_backend_rejected_it(monkeypatch):
+    """A bare "the key was rejected" is true and useless without the provider.
+
+    This pins the trap that produced it. ``/switchmodules`` cannot change
+    *provider* -- that is the ``-b/--backend`` flag -- so
+    ``/switchmodules deepseek-chat`` while the session is on OpenRouter probes
+    **OpenRouter**. The user reads an auth failure, believes their DeepSeek key
+    was rejected, and goes looking in the wrong account. Naming the backend
+    makes the real subject of the sentence unmissable.
+    """
+    from jaz_agent.llm_config import LLMConfigError
+    import jaz_agent.session as session_mod
+
+    monkeypatch.setenv("OPENROUTER_API_KEY", "sk-or-test")
+    monkeypatch.setattr(
+        session_mod,
+        "probe",
+        lambda llm: "authentication failed — the API key was rejected",
+    )
+
+    session = AgentSession()  # no injected llm -> the real probe path runs
+    assert session.backend.name == "openrouter"
+
+    with pytest.raises(LLMConfigError) as caught:
+        session.switch_model("deepseek-chat")
+
+    message = str(caught.value)
+    assert "deepseek-chat is unusable on openrouter" in message
+    assert "authentication failed" in message
 
 
 def test_switch_refuses_while_a_turn_is_running(monkeypatch):

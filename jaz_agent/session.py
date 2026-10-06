@@ -178,13 +178,17 @@ class AgentSession:
 
         target_backend = resolve_backend(backend) if backend else self.backend
         bare = (model or "").strip()
-        # A bare backend name means "move to that provider, model unspecified".
-        if not bare and target_backend is not self.backend:
-            bare = default_model_for(target_backend)
+        # A bare backend name means "that provider's default model". That is a
+        # sensible request even when it names the backend already in use --
+        # ``/switchmodules openrouter`` reads as "put me back on the default",
+        # not as a forgotten model -- so the only thing that is an error is
+        # naming neither.
         if not bare:
-            raise LLMConfigError(
-                "no model given — pass a model name, or a backend to switch to"
-            )
+            if backend is None:
+                raise LLMConfigError(
+                    "no model given — pass a model name, or a backend to switch to"
+                )
+            bare = default_model_for(target_backend)
         bare = target_backend.bare(bare)
 
         candidate = target_backend.build(bare)
@@ -197,7 +201,15 @@ class AgentSession:
         if self._llm is None:
             failure = probe(candidate)
             if failure:
-                raise LLMConfigError(f"{bare} is unusable: {failure}")
+                # Name the backend that answered, not just the model we asked
+                # about. ``/switchmodules`` cannot change *provider* -- that is
+                # ``-b/--backend`` -- so asking for a model that belongs to
+                # another provider probes the one you are already on. Without
+                # the name, "the API key was rejected" sends the user to the
+                # wrong account; with it, "on openrouter" says where to look.
+                raise LLMConfigError(
+                    f"{bare} is unusable on {target_backend.name}: {failure}"
+                )
 
         previous_backend = self.backend
         self.backend, self.model = target_backend, bare

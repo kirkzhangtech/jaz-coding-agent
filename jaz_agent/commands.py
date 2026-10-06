@@ -50,8 +50,8 @@ COMMANDS: tuple[Command, ...] = (
     Command("status", "", "current model, workspace and tool list"),
     Command(
         "switchmodules",
-        "[model]",
-        "browse and switch models on the current backend",
+        "[model|@backend]",
+        "browse and switch models, across backends",
         target="model",
         aliases=("switchmodule",),
     ),

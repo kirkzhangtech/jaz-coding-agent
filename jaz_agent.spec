@@ -21,25 +21,22 @@ from PyInstaller.utils.hooks import collect_data_files, collect_submodules
 # lists, model prices, context windows. These are data, not code, so no amount
 # of `--hidden-import` would collect them.
 #
-# The `includes` filter is not an optimisation, it is a correctness fix.
-# Unfiltered, `collect_data_files("litellm")` returns 933 files, and the great
-# majority of them are litellm's bundled web proxy -- a compiled Next.js admin
-# panel, PNG logos, JS chunks. This agent never starts a proxy, so all of it is
-# dead weight that bloats the build and, worse, buries the handful of JSON
-# tables that pricing actually depends on.
-litellm_datas = collect_data_files("litellm", includes=["*.json", "*.csv"])
+# Unfiltered on purpose. `collect_data_files("litellm")` returns 933 files, and
+# most of them are litellm's bundled web proxy -- a compiled Next.js admin
+# panel, PNG logos, JS chunks -- which this agent never starts. Filtering them
+# out was worth ~40 MB in the onedir build, but "all dependencies" means all of
+# them: a file this size is only worth having if it works when moved somewhere
+# unexpected, and a data file discovered to be missing is exactly the failure
+# that only shows up on someone else's machine.
+litellm_datas = collect_data_files("litellm")
 
 # The provider adapters themselves. litellm imports these lazily by name, one
 # per integration, so a build that only sees the OpenRouter path statically will
-# fail the moment a user switches backend with `/backends`.
-#
-# `proxy` is excluded deliberately: it is litellm's web server, pulls in FastAPI
-# and friends, and this agent never runs it.
-litellm_imports = [
-    name
-    for name in collect_submodules("litellm")
-    if ".proxy" not in name
-]
+# fail the moment a user switches backend with `/backends`. All of them are kept
+# for the same reason as the data files above: `/backends` offers four providers
+# and the user may pick any of them at runtime, with no way to test all four
+# combinations in a frozen build.
+litellm_imports = collect_submodules("litellm")
 
 # jaz is small but reaches for `importlib.resources` in its own sandbox
 # setup; collecting its data keeps the REPL's secure-path resolution working
@@ -66,16 +63,14 @@ a = Analysis(
     hookspath=[],
     hooksconfig={},
     runtime_hooks=[],
-    # Standard library modules litellm reaches for through `importlib` probes
-    # rather than direct imports.
-    excludes=[
-        # tkinter is pulled in by litellm's model-download UI paths and adds
-        # several MB for a TUI that never uses it.
-        "tkinter",
-        "unittest",
-        "pydoc_data",
-        "test",
-    ],
+    # Nothing is excluded from this build. An earlier onedir build dropped
+    # tkinter and litellm's web proxy to save ~40 MB, which was the right call
+    # for a directory that has to be shipped as-is. This build exists to be
+    # *complete* -- one file that works with no Python and no neighbours -- so
+    # anything PyInstaller can carry is carried. If litellm grows a UI path that
+    # imports tkinter at module scope, excluding it here is what would turn a
+    # working build into a `ModuleNotFoundError` on someone else's machine.
+    excludes=[],
     win_no_prefer_redirects=False,
     win_private_assemblies=False,
     cipher=block_cipher,
@@ -84,34 +79,41 @@ a = Analysis(
 
 pyz = PYZ(a.pure, a.zipped_data, cipher=block_cipher)
 
+# ONE FILE. Everything is embedded in the exe, so it can be copied anywhere and
+# run on a machine with no Python installed.
+#
+# The two changes from a standard onedir build are `exclude_binaries=False` --
+# which makes EXE absorb the binary blobs instead of handing them to COLLECT --
+# and the removal of COLLECT entirely.
+#
+# Cost, accepted deliberately: every launch extracts the whole payload to
+# %TEMP% and cleans up afterwards, so startup takes seconds rather than
+# milliseconds. The trade is one self-contained file that survives being moved,
+# emailed or dropped onto a USB stick, against a directory that is fast but only
+# works next to its own `_internal`.
 exe = EXE(
     pyz,
     a.scripts,
+    a.binaries,
+    a.datas,
     [],
-    exclude_binaries=True,
+    exclude_binaries=False,
     name="jaz-agent",
     debug=False,
     bootloader_ignore_signals=False,
     strip=False,
+    # UPX compresses the payload inside the exe, which is most of what makes a
+    # onefile this size bearable. It costs build time and is occasionally
+    # flaky on AV engines, but a 100 MB exe that starts instantly beats a
+    # 60 MB one that does not.
     upx=True,
-    # No console=False: this is a terminal application. A windowed build on
-    # Windows detaches from the terminal, which breaks the TUI outright --
-    # there would be nowhere to draw and no way for the user to type.
+    # console=True, not console=False: this is a terminal application. A
+    # windowed build on Windows detaches from the terminal, which breaks the
+    # TUI outright -- nowhere to draw, no way for the user to type.
     console=True,
     disable_windowed_traceback=False,
     argv_emulation=False,
     target_arch=None,
     codesign_identity=None,
     entitlements_file=None,
-)
-
-coll = COLLECT(
-    exe,
-    a.binaries,
-    a.zipfiles,
-    a.datas,
-    strip=False,
-    upx=True,
-    upx_exclude=[],
-    name="jaz-agent",
 )

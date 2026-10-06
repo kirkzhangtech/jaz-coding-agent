@@ -229,8 +229,12 @@ def test_failed_switch_is_reported_and_leaves_state_alone(monkeypatch):
     what a provider rejection looks like from the caller's side.
     """
     monkeypatch.setenv("OPENROUTER_API_KEY", "sk-or-test")
+    # Patched where the UI read it from (``tui`` binds the name at import), not
+    # in ``llm_config``: patching the origin leaves the already-bound name alone,
+    # so the real catalogue would be fetched and this test would depend on which
+    # models happen to be live. Every other browser test patches ``tui``.
     monkeypatch.setattr(
-        "jaz_agent.llm_config.list_models",
+        "jaz_agent.tui.list_models",
         lambda backend: ["stealth/space-bunny-alpha"],
     )
     monkeypatch.setattr(
@@ -1170,7 +1174,15 @@ def test_hint_shows_the_usage_string(monkeypatch):
     Regression test for a real defect: the hint is Rich markup, so
     ``/switchmodules [model]`` rendered as ``/switchmodules`` and the argument
     shape was never shown at all.
+
+    Checks the table's own usage string rather than a literal copy of it, so
+    rewording the signature cannot quietly turn this into a test of nothing.
     """
+    from jaz_agent.commands import find
+
+    usage = find("switchmodules").usage
+    assert "[" in usage and "@backend" in usage, "this test needs a bracketed usage"
+
     app = _nav_app(monkeypatch)
 
     async def run():
@@ -1182,7 +1194,7 @@ def test_hint_shows_the_usage_string(monkeypatch):
     print("\n--- hint for '/switchmodules' ---")
     print(repr(hint))
 
-    assert "[model]" in hint, "the usage string was eaten as markup"
+    assert usage in hint, "the usage string was eaten as markup"
 
 
 def test_hint_appears_when_a_slash_is_typed(monkeypatch):
@@ -1433,3 +1445,185 @@ def test_mistyped_command_suggests_the_closest(monkeypatch):
     print(blob)
 
     assert "did you mean /switchmodules" in blob
+
+
+# --------------------------------------------------------------------------
+# switching provider from the prompt
+#
+# `/switchmodules` used to be unable to change *provider* -- that was `-b`, and
+# the trade was documented. These pin the reversal. The thing the design had to
+# get right is that a plain model id must keep meaning what it always meant.
+# --------------------------------------------------------------------------
+
+
+def _two_backends(monkeypatch) -> AgentSession:
+    """A session with OpenRouter and DeepSeek keyed, and both catalogues stubbed.
+
+    The names are adversarial rather than tidy. ``openai/gpt-5-mini`` is
+    OpenRouter's, so an implementation that read a vendor prefix as "the openai
+    backend" fails here; and ``deepseek-v4-pro`` exists on *both* providers,
+    which is the whole reason the tag exists.
+    """
+    monkeypatch.setenv("OPENROUTER_API_KEY", "sk-or-test")
+    monkeypatch.setenv("DEEPSEEK_API_KEY", "sk-ds-test")
+    monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+
+    catalogues = {
+        "openrouter": ["stealth/space-bunny-alpha", "openai/gpt-5-mini"],
+        "deepseek": ["deepseek-v4-pro", "deepseek-flash"],
+    }
+    monkeypatch.setattr(
+        "jaz_agent.tui.list_models", lambda backend: list(catalogues[backend.name])
+    )
+    session, _ = _switchable_session()
+    return session
+
+
+def test_switchmodules_moves_to_another_backend(monkeypatch):
+    """``@deepseek <model>`` changes the provider, not just the model."""
+    session = _two_backends(monkeypatch)
+    app = CodingAgentApp(session)
+
+    async def run():
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            await _run_command(app, pilot, "/switchmodules @deepseek deepseek-flash")
+            return app.screen.query_one("#transcript").dump()
+
+    blob = "\n".join(asyncio.run(run()))
+    print("\n--- /switchmodules @deepseek deepseek-flash ---")
+    print(blob)
+
+    assert session.backend.name == "deepseek"
+    assert session.model == "deepseek-flash"
+
+
+def test_a_bare_backend_name_switches_to_its_default_model(monkeypatch):
+    """``/switchmodules deepseek`` is the shorthand for ``@deepseek`` alone."""
+    session = _two_backends(monkeypatch)
+    app = CodingAgentApp(session)
+
+    async def run():
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            await _run_command(app, pilot, "/switchmodules deepseek")
+            return app.screen.query_one("#transcript").dump()
+
+    blob = "\n".join(asyncio.run(run()))
+    print("\n--- /switchmodules deepseek ---")
+    print(blob)
+
+    assert session.backend.name == "deepseek"
+    assert session.model == "deepseek-v4-pro", "the backend's own default, not a guess"
+
+
+def test_a_vendor_prefixed_id_still_means_the_current_backend(monkeypatch):
+    """The regression guard for the whole feature.
+
+    ``openai/gpt-5-mini`` is one of *OpenRouter's* models. Reading the ``openai``
+    prefix as "the openai backend" would move the session onto a provider whose
+    key is not even set -- silently, on the strength of a string that has meant
+    something else since the command was written.
+    """
+    session = _two_backends(monkeypatch)
+    assert session.backend.name == "openrouter"
+    app = CodingAgentApp(session)
+
+    async def run():
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            await _run_command(app, pilot, "/switchmodules openai/gpt-5-mini")
+            return app.screen.query_one("#transcript").dump()
+
+    blob = "\n".join(asyncio.run(run()))
+    print("\n--- /switchmodules openai/gpt-5-mini ---")
+    print(blob)
+
+    assert session.backend.name == "openrouter", "the provider moved on a model id"
+    assert session.model == "openai/gpt-5-mini"
+
+
+def test_browse_spans_backends_and_tags_only_the_others(monkeypatch):
+    """One list, every keyed backend, and a tag exactly where one is needed."""
+    session = _two_backends(monkeypatch)
+    app = CodingAgentApp(session)
+
+    async def run():
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            await _open_model_picker(app, pilot)
+            return app.screen.query_one("#transcript").dump(), _picker_rows(app)
+
+    lines, rows = asyncio.run(run())
+    # Joined, not the raw list: ``dump()`` yields one entry per *display* line,
+    # so an ``in`` against it compares whole lines and a wrapped message cannot
+    # be found at all. Every other test in this file joins for the same reason.
+    blob = "\n".join(lines)
+    print("\n--- /switchmodules (two backends) ---")
+    print(blob)
+    print("rows:", rows)
+
+    # The backend we are on keeps the bare id: that is what a model id means
+    # everywhere else, and 464 rows would otherwise repeat the tag.
+    assert "openai/gpt-5-mini" in rows
+    # Any other backend is tagged, because there the bare id is ambiguous --
+    # the same provider makes both ``deepseek/deepseek-v4-pro`` and
+    # ``deepseek-v4-pro``.
+    assert "@deepseek deepseek-v4-pro" in rows
+    assert "@deepseek deepseek-flash" in rows
+    assert "deepseek-v4-pro" not in rows, "an untagged row would switch the wrong backend"
+
+    assert "4 model(s)" in blob
+    assert "2 backends" in blob
+    assert "openrouter (2)" in blob and "deepseek (2)" in blob
+
+
+def test_picking_a_tagged_row_takes_the_same_path_as_typing_it(monkeypatch):
+    """The arrow must not be a second implementation of the switch."""
+    session = _two_backends(monkeypatch)
+    app = CodingAgentApp(session)
+
+    async def run():
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            await _open_model_picker(app, pilot)
+            rows = _picker_rows(app)
+            app._selected = rows.index("@deepseek deepseek-v4-pro")
+            await pilot.press("enter")
+            for _ in range(25):
+                await pilot.pause(0.05)
+                await asyncio.sleep(0.02)
+            return app.screen.query_one("#transcript").dump()
+
+    blob = "\n".join(asyncio.run(run()))
+    print("\n--- picked @deepseek deepseek-v4-pro ---")
+    print(blob)
+
+    assert session.backend.name == "deepseek"
+    assert session.model == "deepseek-v4-pro"
+
+
+def test_a_mistyped_backend_is_an_error_not_a_search(monkeypatch):
+    """``@deapseak`` must name the typo and the known names, not filter.
+
+    Falling through to the filter path would report "no model matches" and hide
+    a misspelled provider inside a search result.
+    """
+    session = _two_backends(monkeypatch)
+    app = CodingAgentApp(session)
+
+    async def run():
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            await _run_command(app, pilot, "/switchmodules @deapseak deepseek-flash")
+            return app.screen.query_one("#transcript").dump(), _picker_rows(app)
+
+    lines, rows = asyncio.run(run())
+    blob = "\n".join(lines)
+    print("\n--- /switchmodules @deapseak ---")
+    print(blob)
+
+    assert "unknown backend" in blob
+    assert "deepseek" in blob, "the known names must come with the complaint"
+    assert not rows, "a mistyped backend opened a model list"
+    assert session.backend.name == "openrouter"

@@ -41,7 +41,16 @@ from .commands import (
     picker_rows,
 )
 from .context import report as context_report
-from .llm_config import available_backends, describe_model, list_models
+from .llm_config import (
+    BACKEND_MARK,
+    LLMConfigError,
+    SwitchRequest,
+    available_backends,
+    describe_model,
+    list_models,
+    parse_switch_request,
+    resolve_backend,
+)
 from .session import AgentSession
 from .tools import ROOT, tool_catalog
 
@@ -794,22 +803,36 @@ class CodingAgentApp(App[None]):
         self._selected = models.index(current) if current in models else 0
         self._render_candidates()
 
-    def _select_model(self, model: str) -> None:
-        """Switch to *model*, on a worker, through the same validated path.
+    def _select_model(self, row: str) -> None:
+        """Switch to a picked *row*, through the same validated path.
 
-        Routed back through ``/switchmodules <model>`` rather than applied
-        directly so that the live probe, the "not switched" wording and the
-        catalogue-rejected case are exactly the ones the typed command gets.
-        Two paths to the same switch would drift, and the probe is the part that
-        must not be skipped.
+        Routed back through :func:`parse_switch_request` -- the exact function
+        ``/switchmodules`` uses on its argument -- rather than applied directly,
+        so the live probe, the "not switched" wording and the
+        catalogue-rejected case are the ones the typed command gets. Two paths
+        to the same switch would drift, and the probe is the part that must not
+        be skipped.
+
+        The decode happens in the worker for the same reason the fetch does:
+        ``parse_switch_request`` can raise, and a raise on the UI thread would
+        surface as a widget error rather than as a message.
         """
-        self._say(f"switching to {model} …", Kind.THINKING)
+        self._say(f"switching to {row} …", Kind.THINKING)
         threading.Thread(
-            target=self._try_switch_then_filter,
-            args=(model,),
+            target=self._switch_row,
+            args=(row,),
             name="jaz-switch-try",
             daemon=True,
         ).start()
+
+    def _switch_row(self, row: str) -> None:
+        """Decode a picked row, then take the ordinary switch path."""
+        try:
+            request = parse_switch_request(row, current=self.session.backend)
+        except LLMConfigError as exc:
+            self.session.bridge.emit(Kind.ERROR, str(exc))
+            return
+        self._try_switch_then_filter(request)
 
     def _clear_candidates(self) -> None:
         """Drop the navigable rows. Called whenever the list cannot apply."""
@@ -1023,30 +1046,33 @@ class CodingAgentApp(App[None]):
     MODEL_PAGE_SIZE = 18
 
     def action_switch_modules(self, argument: str = "") -> None:
-        """``/switchmodules`` — browse and switch models on the current backend.
+        """``/switchmodules`` — browse and switch models, across backends.
 
-        Without an argument this lists the catalogue; with one it switches. The
-        argument accepts a filter, so ``/switchmodules gpt-5`` narrows the list
-        rather than jumping straight to a switch — OpenRouter currently offers
-        463 models, so an unfiltered dump would be unreadable.
+        The argument is decoded by :func:`parse_switch_request`, which knows the
+        three forms: ``@<backend> [model]``, a bare backend name, and everything
+        else -- which is a model id or a filter, decided by catalogue membership.
 
-        The list is fetched on a worker: it is a network call, and OpenRouter's
+        Without an argument it lists what every backend with a key offers, plus
+        the backend in use. One command is the whole surface: the flag that used
+        to be the only way to change provider, ``-b``, stays for scripting but is
+        no longer the only door.
+
+        The list is fetched on a worker: it is a network call per backend, and a
         catalogue can be slow.
         """
-        query = argument.strip()
+        try:
+            request = parse_switch_request(argument, current=self.session.backend)
+        except LLMConfigError as exc:
+            # An unknown ``@backend``. parse_switch_request deliberately lets
+            # this raise rather than treating it as a filter, so the typo is
+            # reported as a typo and the known names come with it.
+            self._say(str(exc), Kind.ERROR)
+            return
 
-        # No argument: browse. With one: try a switch first, then fall back to
-        # filtering. Trying the switch first is right because it is validated --
-        # a name that is not a real model fails the probe cheaply and lands in
-        # the filter path instead, with nothing committed.
-        #
-        # The switch attempt has to be distinguished from a *successful* one, and
-        # a worker reports failures by emitting rather than by raising, so the
-        # decision is made here on the session state, not on an exception.
-        if query:
+        if request.is_switch:
             threading.Thread(
                 target=self._try_switch_then_filter,
-                args=(query,),
+                args=(request,),
                 name="jaz-switch-try",
                 daemon=True,
             ).start()
@@ -1055,16 +1081,53 @@ class CodingAgentApp(App[None]):
         self._say(f"loading models from {self.session.backend.name} …", Kind.THINKING)
         threading.Thread(
             target=self._models_worker,
-            args=("",),
+            args=(request.filter,),
             name="jaz-models",
             daemon=True,
         ).start()
 
-    def _try_switch_then_filter(self, query: str) -> None:
-        """Switch if *query* names a real model, otherwise browse with it as a filter.
+    def _browse_targets(self) -> list[Backend]:
+        """The backends the browser draws from, in display order.
+
+        The backend in use comes first, then every other one that has a key.
+        Hard-coding "the current backend" was right while the command could not
+        change provider; now that it can, a browser that showed only the current
+        backend would be a list you cannot leave.
+
+        The current backend is included even with no key: browsing it already
+        works offline off ``well_known``, and dropping it would mean a keyless
+        session could not see the models it is choosing between.
+        """
+        current = self.session.backend
+        targets = [current]
+        for name, has_key in available_backends():
+            backend = resolve_backend(name)
+            if has_key and backend is not current:
+                targets.append(backend)
+        return targets
+
+    def _entries(self, backend: Backend, models: list[str]) -> list[tuple[str, Backend]]:
+        """Pair each id with the string that will be submitted for its row.
+
+        A row on the backend you are *on* is the bare id. That is what a model
+        id means everywhere else in the UI, and it keeps 464 OpenRouter rows
+        from each repeating ``@openrouter``.
+
+        A row on any other backend is tagged, because there the bare id is
+        genuinely ambiguous: ``deepseek/deepseek-v4-pro`` is one of OpenRouter's
+        models *and* what DeepSeek's own ``deepseek-v4-pro`` routes to. Tagging
+        only the rows that need it means the display never says something the
+        command would not accept.
+        """
+        tag = "" if backend is self.session.backend else f"{BACKEND_MARK}{backend.name} "
+        return [(f"{tag}{model}", backend) for model in models]
+
+    def _try_switch_then_filter(self, request: SwitchRequest) -> None:
+        """Switch if the request names a real model, otherwise browse with it.
 
         Runs on a worker: both the catalogue fetch and the probe are network
-        calls.
+        calls. ``request.backend`` decides *which* catalogue, so ``@deepseek``
+        checks DeepSeek's list rather than the one we happen to be on.
 
         Membership is decided by the catalogue rather than by attempting the
         switch and catching the failure. Relying on the exception would be
@@ -1073,25 +1136,41 @@ class CodingAgentApp(App[None]):
         reached. Checking the catalogue first makes the branch depend only on
         what actually exists.
         """
-        backend = self.session.backend
-        bare = backend.bare(query)
+        target = request.backend or self.session.backend
+        model = request.model
+
+        if model is None:
+            # A bare backend name: nothing to look up, the target's own default
+            # is the answer, and switching to it is the request.
+            self._commit(None, target)
+            return
 
         try:
-            models = list_models(backend)
+            models = list_models(target)
         except Exception as exc:
             self.session.bridge.emit(
                 Kind.ERROR, f"could not load the model list — {type(exc).__name__}: {exc}"
             )
             return
 
+        bare = target.bare(model)
         # Exact match on the bare id: an exact match on the routed id. Anything
         # else is a filter, and the filter path reports its own "no match".
-        if models and bare not in models and query not in models:
-            self._emit_models(models, query)
+        if models and bare not in models and model not in models:
+            self._emit_models(self._entries(target, models), model)
             return
 
+        self._commit(model, target)
+
+    def _commit(self, model: str | None, target: Backend) -> None:
+        """Perform the switch and report it, or report why it did not happen.
+
+        The one place a switch is applied, so the probe, the "not switched"
+        wording and the state change cannot differ between the paths that reach
+        it -- a typed ``@deepseek x`` and a row picked with the arrow.
+        """
         try:
-            note = self.session.switch_model(bare)
+            note = self.session.switch_model(model, backend=target.name)
         except Exception as exc:
             # It was in the catalogue but the provider refused it -- a key
             # problem, a rate limit, a model that just went away.
@@ -1105,21 +1184,26 @@ class CodingAgentApp(App[None]):
         ).start()
 
     def _models_worker(self, query: str) -> None:
-        """Body of the browse thread: fetch the catalogue, then report.
+        """Body of the browse thread: fetch every target's catalogue, then report.
 
         Emits onto the queue like every other worker -- it must not touch a
         widget, which is why the list is formatted here rather than in the drain.
-        """
-        try:
-            models = list_models(self.session.backend)
-        except Exception as exc:
-            self.session.bridge.emit(
-                Kind.ERROR, f"could not load the model list — {type(exc).__name__}: {exc}"
-            )
-            return
-        self._emit_models(models, query)
 
-    def _emit_models(self, models: list[str], query: str = "") -> None:
+        A backend that fails is skipped rather than fatal. One provider being
+        down must not take the list down with it: the backend you are on is
+        always in the list, so a failure at least leaves you able to browse
+        where you already are.
+        """
+        entries: list[tuple[str, Backend]] = []
+        for backend in self._browse_targets():
+            try:
+                models = list_models(backend)
+            except Exception:
+                continue
+            entries.extend(self._entries(backend, models))
+        self._emit_models(entries, query)
+
+    def _emit_models(self, entries: list[tuple[str, Backend]], query: str = "") -> None:
         """Filter, then hand the whole result set to the UI thread.
 
         Shared by the browse path and the "that was not a model, here is what
@@ -1131,12 +1215,12 @@ class CodingAgentApp(App[None]):
         instead, so the whole set goes across and the viewport decides what is
         visible.
         """
-        backend = self.session.backend
+        current_backend = self.session.backend
 
-        if not models:
+        if not entries:
             self.session.bridge.emit(
                 Kind.ERROR,
-                f"no models available from {backend.name}; check the network, "
+                f"no models available from {current_backend.name}; check the network, "
                 f"or name a model directly with /switchmodules <model>",
             )
             return
@@ -1144,21 +1228,38 @@ class CodingAgentApp(App[None]):
         if query:
             needle = query.lower()
             # Substring first -- "gpt" finds "openai/gpt-5-mini". Then a
-            # subsequence match so "gpt5" finds "gpt-5" as well.
-            substring = [m for m in models if needle in m.lower()]
-            fuzzy = [
-                m for m in models if needle not in m.lower() and _subsequence(needle, m.lower())
+            # subsequence match so "gpt5" finds "gpt-5" as well. Matching the
+            # *row* rather than the id means "deepseek" also narrows to the
+            # rows tagged with that backend, which is what a reader expects a
+            # search over what is on screen to do.
+            kept = [
+                e for e in entries if needle in e[0].lower()
+            ] or [
+                e
+                for e in entries
+                if _subsequence(needle, e[0].lower())
             ]
-            models = substring or fuzzy
+            entries = kept
 
-        if not models:
+        if not entries:
             self.session.bridge.emit(
-                Kind.ERROR, f"no model matches {query!r} on {backend.name}"
+                Kind.ERROR, f"no model matches {query!r} on {current_backend.name}"
             )
             return
 
-        total = len(models)
-        header = f"{total} model(s) on {backend.name}"
+        rows = [name for name, _ in entries]
+        # Display order, with the count each backend contributed, so the header
+        # accounts for every row the viewport can reach.
+        counts: dict[str, int] = {}
+        for _, backend in entries:
+            counts[backend.name] = counts.get(backend.name, 0) + 1
+
+        total = len(rows)
+        if len(counts) == 1:
+            header = f"{total} model(s) on {next(iter(counts))}"
+        else:
+            breakdown = ", ".join(f"{name} ({n})" for name, n in counts.items())
+            header = f"{total} model(s) from {len(counts)} backends: {breakdown}"
         if query:
             header += f" matching {query!r}"
 
@@ -1169,13 +1270,13 @@ class CodingAgentApp(App[None]):
         # starting at row 0 would mean ↓ picks a model the user was not looking
         # at. The picker scrolls to it; when the model was filtered out of the
         # result set there is nothing to scroll to, so say which one is live.
-        if query and current not in models:
+        if query and current not in rows:
             lines.append(f" current: {current}  (not in these results)")
 
         self.session.bridge.emit(
             Kind.STATUS,
             "\n".join(lines),
-            models=list(models),
+            models=rows,
             current=current,
         )
 

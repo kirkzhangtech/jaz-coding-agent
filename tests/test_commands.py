@@ -515,8 +515,12 @@ def test_candidates_expose_the_name_and_the_layout():
         command = find(row.name)
         assert command is not None, f"{row.name!r} is not a command"
         assert row.signature == command.signature
-        # The whole point of carrying both: the shown form is not submittable.
-        assert row.signature != row.name, f"{row.name!r} lost its argument shape"
+        if command.usage:
+            # The whole point of carrying both: for a command that takes an
+            # argument the shown form is not submittable. ``/status`` keeps
+            # this honest -- no argument means the two forms are the same
+            # string, so there is nothing to tell apart.
+            assert row.signature != row.name, f"{row.name!r} lost its argument shape"
 
     assert all(c.summary for c in rows), "a row has no summary"
     assert all(c.lines for c in rows), "a row has no rendered text"

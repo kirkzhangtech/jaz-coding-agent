@@ -21,6 +21,7 @@ only the chosen backend and model ids.
 from __future__ import annotations
 
 import os
+from collections.abc import Iterable
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -103,7 +104,11 @@ class Backend:
         """Return the first credential this backend accepts.
 
         Raises :class:`LLMConfigError` naming the variables to set, rather than
-        failing later with a 401 that costs a full agent turn.
+        failing later with a 401 that costs a full agent turn. The wording
+        names the *process*, because the common false alarm is a key that is set
+        in another window: environment variables are inherited at launch, so a
+        shell (or IDE) opened before they were set cannot pass them on, and
+        "no API key" then reads as "your key is wrong" when it is not.
         """
         for var in self.key_vars:
             value = os.environ.get(var, "").strip()
@@ -112,7 +117,10 @@ class Backend:
         wanted = " or ".join(self.key_vars)
         hint = KEY_HINTS.get(self.name, "")
         raise LLMConfigError(
-            f"no API key for backend {self.name!r}.\nSet one of: {wanted}"
+            f"no API key for backend {self.name!r}: this process cannot see "
+            f"{wanted}.\n"
+            "Set it, then start jaz-agent from a shell that has it (a terminal "
+            "opened earlier does not inherit it)."
             + (f"\n{hint}" if hint else "")
         )
 
@@ -126,6 +134,25 @@ class Backend:
             "timeout": float(os.environ.get("JAZ_HTTP_TIMEOUT", "180")),
             "max_retries": int(os.environ.get("JAZ_MAX_RETRIES", "3")),
         }
+        # How much output to ask for. Unset means "whatever the model offers",
+        # which is what an agent wants -- but a provider can refuse the request
+        # outright when the account cannot *afford* that many tokens. OpenRouter
+        # answers a full-max request with
+        #
+        #     This request requires more credits, or fewer max_tokens. You
+        #     requested up to 65536 tokens, but can only afford 18377.
+        #
+        # so on a small balance every turn fails until the ask comes down. Kept
+        # opt-in: silently truncating long answers for everyone would be a worse
+        # default than an error that names the knob.
+        cap = os.environ.get("JAZ_MAX_TOKENS", "").strip()
+        if cap:
+            try:
+                defaults["max_tokens"] = int(cap)
+            except ValueError:
+                raise LLMConfigError(
+                    f"JAZ_MAX_TOKENS must be a whole number, got {cap!r}"
+                ) from None
         if self.headers:
             defaults["extra_headers"] = dict(self.headers)
         defaults.update(request_defaults)
@@ -297,7 +324,7 @@ def parse_switch_request(argument: str, *, current: Backend) -> SwitchRequest:
 
 
 def list_models(backend: Backend) -> list[str]:
-    """Best-effort model list for *backend*.
+    """Best-effort model list for *backend*, filtered to what can be called.
 
     Falls back to ``backend.well_known`` when discovery fails -- being offline
     should degrade the menu, not break it. A failure here is never fatal: the
@@ -314,7 +341,31 @@ def list_models(backend: Backend) -> list[str]:
         found = _list_openrouter_models(backend)
     elif backend.name == "deepseek":
         found = _list_deepseek_models(backend)
-    return found or list(backend.well_known)
+    return chat_models(found or list(backend.well_known))
+
+
+#: Model-id suffixes that name a *different endpoint* rather than a chat
+#: variant. OpenRouter spells them after a colon, and ``:batch`` is the Batches
+#: API, which ``chat/completions`` refuses outright -- captured live::
+#:
+#:     openai/gpt-5-mini:batch cannot be used with the chat/completions
+#:     endpoint (adapter OpenAIBatchAdapter)
+#:
+#: Every other suffix (``:free``, ``:nitro``, ``:online``, ``:floor``,
+#: ``:thinking``, ``:extended``) routes to the same endpoint and stays in the
+#: list. A catalogue with 465 rows carries 33 of these, and each one was a row
+#: that could only ever fail the probe -- which is how a user picks a model that
+#: looks fine and is told it is unusable.
+NON_CHAT_SUFFIXES: tuple[str, ...] = (":batch",)
+
+
+def chat_models(models: Iterable[str]) -> list[str]:
+    """The subset of *models* this agent can actually call.
+
+    One definition, used by the browser, the Tab completer and ``--check``, so
+    the three cannot disagree about what is on offer.
+    """
+    return [m for m in models if not m.lower().endswith(NON_CHAT_SUFFIXES)]
 
 
 def _fetch_model_ids(url: str, headers: dict[str, str] | None = None) -> list[str]:
@@ -402,6 +453,26 @@ def _describe(exc: Exception) -> str:
     lowered = raw.lower()
     bare = name.lower()
 
+    # Checked before "not found": the batch refusal is a 404 whose text never
+    # says "not found", and reporting it as a missing model sends the user to
+    # the catalogue to look for a row that is sitting right there.
+    if "batch" in lowered:
+        return "batch-only model — it cannot be called through the chat endpoint"
+    # Also checked before the connection branch, because litellm reports
+    # anything that goes wrong while *preparing* a request as an
+    # APIConnectionError: a frozen build with no tiktoken plugin fails with
+    # "Unknown encoding cl100k_base", which read as "check the network" and sent
+    # the user hunting for a network fault on a machine whose network was fine.
+    if "tiktoken" in lowered or "unknown encoding" in lowered:
+        return "this build has no tokenizer (tiktoken) — not a network problem"
+    # OpenRouter geo-gates some models per region and answers 403 with a JSON
+    # body; nothing about it is actionable unless it is said in words, and the
+    # raw payload is long enough to bury the reason.
+    if "region" in lowered or "geo" in lowered:
+        return (
+            "the provider refuses this model from your region — pick another "
+            "model, or route the request through a different network"
+        )
     if "auth" in bare or "unauthorized" in lowered or "invalid api key" in lowered:
         return "authentication failed — the API key was rejected"
     # Covers "is not a valid model ID", "model not found", "does not exist".
@@ -414,10 +485,27 @@ def _describe(exc: Exception) -> str:
         return "model not found, or not available on this backend"
     if "rate limit" in lowered or "429" in lowered:
         return "rate limited — try again shortly"
-    if "credit" in lowered and ("insufficient" in lowered or "exceeded" in lowered):
-        return "insufficient credits on this account"
+    if "credit" in lowered and (
+        "insufficient" in lowered or "exceeded" in lowered or "afford" in lowered
+    ):
+        # The wording matters more than usual here: the account is not empty, it
+        # is too small for the *requested output size*, and the fix is either
+        # more credit or a smaller ask. Naming the knob turns a dead end into a
+        # command the user can run.
+        return (
+            "insufficient credits for this request — the account cannot afford the "
+            "requested output size; add credits, or set JAZ_MAX_TOKENS (e.g. 8192)"
+        )
     if "connect" in bare or "timeout" in bare or "connection" in lowered:
-        return "could not reach the provider — check the network"
+        # The transport text is the whole diagnosis here -- "connection refused",
+        # "name or service not known", "SSL: CERTIFICATE_VERIFY_FAILED" and a
+        # plain timeout need four different fixes -- and none of them carry
+        # account details, so it is safe to pass on. The friendly sentence stays
+        # first, because that is the part that says what to do about it.
+        detail = _redact(raw)[:120]
+        return "could not reach the provider — check the network" + (
+            f" ({detail})" if detail else ""
+        )
 
     return f"{name}: {_redact(raw)[:200]}" if raw else name
 

@@ -8,9 +8,29 @@ import warnings
 from pathlib import Path
 from queue import Empty
 
+from .bridge import Event, Kind
 from .llm_config import LLMConfigError
 from .session import AgentSession
 from .tools import ROOT
+
+
+def _drain(session: AgentSession) -> list[Event]:
+    """Everything the finished turn queued, in order.
+
+    The TUI drains this queue on a timer; the one-shot path has to do it by
+    hand, because it is the only place the failure of a turn is reported.
+    """
+    events: list[Event] = []
+    while True:
+        try:
+            events.append(session.queue.get_nowait())
+        except Empty:
+            return events
+
+
+def _failures(events: list[Event]) -> list[str]:
+    """The error texts in *events*, newest last. Empty when the turn was clean."""
+    return [event.text for event in events if event.kind is Kind.ERROR]
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -142,14 +162,28 @@ def main(argv: list[str] | None = None) -> int:
 
     if args.prompt:
         try:
-            print(session.run_sync(args.prompt))
-            return 0
+            report = session.run_sync(args.prompt)
         except LLMConfigError as exc:
             print(f"error: {exc}", file=sys.stderr)
             return 3
         except KeyboardInterrupt:
             print("\ninterrupted", file=sys.stderr)
             return 130
+
+        # ``run_sync`` reports a failed turn through the event queue rather than
+        # by raising -- the agent loop swallows everything so that one bad turn
+        # cannot kill the UI. Nothing drains that queue here, so a failure used
+        # to print an empty line and exit 0: a one-shot run that says nothing is
+        # worse than one that says what went wrong, and it is indistinguishable
+        # from a task that legitimately finished.
+        failures = _failures(_drain(session))
+        if failures and not report:
+            for text in failures:
+                print(f"error: {text}", file=sys.stderr)
+            return 1
+
+        print(report)
+        return 0
 
     try:
         from .tui import run_tui

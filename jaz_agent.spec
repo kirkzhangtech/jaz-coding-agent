@@ -59,7 +59,19 @@ a = Analysis(
     hiddenimports=litellm_imports
     # The default provider is OpenRouter, so its adapter must survive even when
     # litellm's own module scan misses it.
-    + ["litellm.llms.openrouter.chat"],
+    + ["litellm.llms.openrouter.chat"]
+    # tiktoken resolves its encoding plugin by *name* at runtime
+    # (``importlib.import_module("tiktoken_ext.openai_public")``), so no import
+    # statement anywhere points at it and PyInstaller's graph never sees it.
+    # Without it every frozen build in which litellm counts tokens raises
+    #
+    #     Unknown encoding cl100k_base. Plugins found: []
+    #
+    # -- and because that happens while the request is being *prepared*, litellm
+    # wraps it in APIConnectionError, so the user is told to "check the network"
+    # on a machine whose network is fine. The BPE tables themselves are fetched
+    # on first use and cached under %TEMP%; this entry is the whole fix.
+    + ["tiktoken_ext.openai_public"],
     hookspath=[],
     hooksconfig={},
     runtime_hooks=[],

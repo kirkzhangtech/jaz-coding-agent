@@ -17,6 +17,8 @@ import warnings
 
 from jaz import MockLLMClient
 
+from jaz_agent import tui
+from jaz_agent.bridge import Kind
 from jaz_agent.session import AgentSession
 from jaz_agent.tui import CodingAgentApp
 
@@ -157,6 +159,91 @@ async def _run_command(app, pilot, text: str, settle: float = 0.4) -> None:
     await pilot.pause(settle)
 
 
+def test_the_header_follows_the_session_not_the_switch_event(monkeypatch):
+    """The model on screen must be the model in use -- however it changed.
+
+    The header used to be redrawn only when the switching path remembered to
+    flag its event. Every other way of changing the session then left the header
+    (and the status line) naming the model the session had just left, which is
+    indistinguishable from a switch that did not happen. Driven here with no UI
+    involvement at all.
+    """
+    monkeypatch.setenv("OPENROUTER_API_KEY", "sk-or-test")
+
+    session, _ = _switchable_session()
+    app = CodingAgentApp(session)
+
+    async def run():
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            before = _banner_text(app)
+            session.switch_model("openai/gpt-5-mini")  # no event, no flag
+            for _ in range(6):
+                await pilot.pause(0.05)
+            return before, _banner_text(app), app.screen.query_one("#status").model
+
+    before, after, status_model = asyncio.run(run())
+    print(f"\n--- header follows the session ---\nbefore={before!r}\nafter={after!r}")
+
+    assert "space-bunny-alpha" in before, "the header never had the model"
+    assert "gpt-5-mini" in after, "the header still names the model just left"
+    assert "gpt-5-mini" in status_model, "the status line still names it too"
+
+
+def test_status_says_whether_the_key_is_visible(monkeypatch):
+    """The one diagnostic behind "I set the key and it still refuses".
+
+    ``has_key`` reads the environment live, so the answer changes as soon as
+    the variable does -- no restart needed to tell the two cases apart.
+    """
+    monkeypatch.delenv("OPENROUTER_API_KEY", raising=False)
+    monkeypatch.delenv("OR_API_KEY", raising=False)
+
+    session, _ = _switchable_session()
+    app = CodingAgentApp(session)
+
+    async def run():
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            await _run_command(app, pilot, "/status")
+            missing = "\n".join(app.screen.query_one("#transcript").dump())
+            monkeypatch.setenv("OPENROUTER_API_KEY", "sk-or-test")
+            await _run_command(app, pilot, "/status")
+            present = "\n".join(app.screen.query_one("#transcript").dump())
+            return missing, present
+
+    missing, present = asyncio.run(run())
+    print(f"\n--- /status without a key ---\n{missing}")
+
+    assert "api key: NOT visible to this process" in missing
+    assert "api key: visible" in present
+
+
+def test_the_greeting_warns_when_no_key_is_visible(monkeypatch):
+    """Said at startup, where the user is, not on the first failure.
+
+    Without a key the process cannot reach the model at all, so the next thing
+    the user does -- type a task, or switch model -- is the thing that cannot
+    work. Warning afterwards means they have already misdiagnosed it.
+    """
+    monkeypatch.delenv("OPENROUTER_API_KEY", raising=False)
+    monkeypatch.delenv("OR_API_KEY", raising=False)
+
+    session, _ = _switchable_session()
+    app = CodingAgentApp(session)
+
+    async def run():
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            return "\n".join(app.screen.query_one("#transcript").dump())
+
+    blob = asyncio.run(run())
+    print(f"\n--- greeting with no key ---\n{blob}")
+
+    assert "no OPENROUTER_API_KEY or OR_API_KEY visible to this process" in blob
+    assert "start jaz-agent again" in blob
+
+
 def test_status_command_reports_the_current_model(monkeypatch):
     """The model commands must remain discoverable from /help."""
     monkeypatch.setenv("OPENROUTER_API_KEY", "sk-or-test")
@@ -235,7 +322,7 @@ def test_failed_switch_is_reported_and_leaves_state_alone(monkeypatch):
     # models happen to be live. Every other browser test patches ``tui``.
     monkeypatch.setattr(
         "jaz_agent.tui.list_models",
-        lambda backend: ["stealth/space-bunny-alpha"],
+        lambda backend: ["stealth/space-bunny-alpha", "openai/gpt-5-mini"],
     )
     monkeypatch.setattr(
         "jaz_agent.session.probe", lambda llm: "model not found, or not available on this backend"
@@ -248,9 +335,11 @@ def test_failed_switch_is_reported_and_leaves_state_alone(monkeypatch):
     async def run():
         async with app.run_test() as pilot:
             await pilot.pause()
-            # The id is in the catalogue, so this takes the switch branch rather
-            # than the filter branch, and the probe is what rejects it.
-            await _run_command(app, pilot, "/switchmodules stealth/space-bunny-alpha")
+            # A *different* id that the catalogue lists, so this takes the
+            # switch branch rather than the filter branch, and the probe is what
+            # rejects it. Switching to the model already live is the one target
+            # that cannot fail -- it is a no-op, so it never reaches the probe.
+            await _run_command(app, pilot, "/switchmodules openai/gpt-5-mini")
             return app.screen.query_one("#transcript").dump()
 
     blob = "\n".join(asyncio.run(run()))
@@ -414,6 +503,10 @@ def test_switchmodules_paginates_a_large_catalogue(monkeypatch):
     )
 
     session, _ = _switchable_session()
+    # The live model is part of this catalogue, so the browser holds exactly the
+    # catalogue. This test is about paging, not about the case where the
+    # provider serves a model it does not advertise.
+    session.model = "vendor/model-0"
     app = CodingAgentApp(session)
 
     async def run():
@@ -454,6 +547,9 @@ def test_every_model_is_reachable_by_scrolling(monkeypatch):
         lambda backend: [f"vendor/model-{i:03d}" for i in range(464)],
     )
     session, _ = _switchable_session()
+    # As above: the live model is in the catalogue, so the row count is the
+    # catalogue count and the cursor starts at the top.
+    session.model = "vendor/model-000"
     app = CodingAgentApp(session)
 
     async def run():
@@ -562,6 +658,13 @@ def test_switchmodules_does_not_repeat_the_current_model(monkeypatch):
 def test_switchmodules_with_an_exact_model_switches(monkeypatch):
     """Naming a model outright should switch, not browse."""
     monkeypatch.setenv("OPENROUTER_API_KEY", "sk-or-test")
+    # The catalogue is stubbed rather than fetched: the branch under test is
+    # "is this argument a model?", and against the live list the answer arrives
+    # after a network round-trip -- which is also what made this test flaky.
+    monkeypatch.setattr(
+        "jaz_agent.tui.list_models",
+        lambda backend: ["stealth/space-bunny-alpha", "openai/gpt-5-mini"],
+    )
 
     session, _ = _switchable_session()
     app = CodingAgentApp(session)
@@ -762,9 +865,38 @@ def test_hint_is_vertical(monkeypatch):
     print("\n--- vertical hint for '/s' ---")
     print(hint)
 
-    lines = [line for line in hint.splitlines() if line.strip()]
+    # The cursor and the key legend bracket the list; the rows are what has to
+    # stay one per line.
+    lines = [line for line in hint.splitlines() if "/status" in line or "/switchmodules" in line]
     assert len(lines) == 2, f"expected /status and /switchmodules on separate lines: {lines}"
     assert "/status" in lines[0] and "/switchmodules" in lines[1]
+
+
+def test_the_command_list_shows_its_selection_immediately(monkeypatch):
+    """Typing ``/s`` must show the cursor and the key legend straight away.
+
+    The list was rendered and then immediately overwritten by its plain-text
+    form, so no row carried a cursor and the "↑/↓ choose" legend was invisible
+    until the user pressed a key -- a key whose effect is only discoverable
+    from the legend. The list looked like a printed page, not a menu.
+    """
+    monkeypatch.setenv("OPENROUTER_API_KEY", "sk-or-test")
+    monkeypatch.setattr("jaz_agent.tui.list_models", lambda backend: [])
+
+    session, _ = _switchable_session()
+    app = CodingAgentApp(session)
+
+    async def run():
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            return await _type_slash(app, pilot, "/s")
+
+    hint = asyncio.run(run())
+    print("\n--- hint for '/s', before any key ---")
+    print(hint)
+
+    assert "▸" in hint, "the first row carries no cursor"
+    assert "Esc dismiss" in hint, "the key legend is missing"
 
 
 # --------------------------------------------------------------------------
@@ -985,6 +1117,144 @@ def test_model_picker_marks_the_current_model(monkeypatch):
     marked = [line for line in hint.splitlines() if "✓" in line]
     assert len(marked) == 1, f"exactly one row is marked current: {marked}"
     assert "gpt-5-mini" in marked[0], "the wrong row is marked"
+
+
+def test_switchmodules_accounts_for_a_model_the_catalogue_does_not_list(monkeypatch):
+    """A model the provider serves but does not advertise must still be shown.
+
+    Not hypothetical: the live OpenRouter catalogue does not contain this
+    session's default ``stealth/space-bunny-alpha``. The browser then opened on
+    row 0 with no tick on any row, so the model in use was invisible -- and
+    Enter committed whichever unrelated model happened to be first.
+    """
+    monkeypatch.setenv("OPENROUTER_API_KEY", "sk-or-test")
+    monkeypatch.setattr(
+        "jaz_agent.tui.list_models",
+        lambda backend: ["aion-labs/aion-2.0", "openai/gpt-5-mini"],
+    )
+    session, _ = _switchable_session()
+    app = CodingAgentApp(session)
+
+    async def run():
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            await _open_model_picker(app, pilot)
+            return (
+                _picker_rows(app),
+                app._selected,
+                app._candidates[0].lines[0],
+                _hint_text(app),
+                app.screen.query_one("#transcript").dump(),
+            )
+
+    rows, selected, first_line, hint, lines = asyncio.run(run())
+    blob = "\n".join(lines)
+    print("\n--- catalogue without the current model ---")
+    print(blob)
+    print(f"rows={rows} selected={selected}")
+
+    assert rows[0] == session.model, "the unlisted model is not in the list"
+    assert selected == 0, "the picker did not open on the current model"
+    assert "✓" in first_line, "the current model is not marked"
+    assert f"current: {session.model}" in blob, "the list does not name it"
+    assert "not in this catalogue" in blob, "the reason is not stated"
+    assert "✓" in hint, "the mark did not reach the screen"
+
+
+def test_choosing_the_current_model_is_a_no_op(monkeypatch):
+    """Enter on the row for the live model must not pretend to switch.
+
+    The row is there so the user can see where they are; pressing Enter used to
+    fall through to the catalogue lookup, which does not list that model, and
+    answered "no model matches" -- for the model already in use.
+    """
+    monkeypatch.setenv("OPENROUTER_API_KEY", "sk-or-test")
+    monkeypatch.setattr(
+        "jaz_agent.tui.list_models",
+        lambda backend: ["aion-labs/aion-2.0", "openai/gpt-5-mini"],
+    )
+    session, _ = _switchable_session()
+    app = CodingAgentApp(session)
+
+    async def run():
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            await _open_model_picker(app, pilot)
+            await pilot.press("enter")
+            for _ in range(20):
+                await pilot.pause(0.05)
+                await asyncio.sleep(0.02)
+            return session.model, app._picker, app.screen.query_one("#transcript").dump()
+
+    model, picker, lines = asyncio.run(run())
+    blob = "\n".join(lines)
+    print("\n--- Enter on the current model ---")
+    print(blob)
+
+    assert model == "stealth/space-bunny-alpha", "the no-op moved the session"
+    assert picker is None, "the picker stayed open"
+    assert "already on" in blob
+    assert "no model matches" not in blob, "the live model was searched for"
+
+
+def test_naming_the_live_model_again_is_a_no_op(monkeypatch):
+    """Typing the id the session is already on must not be an error either.
+
+    The same rule as the picked row, typed instead of chosen: the catalogue is
+    not the authority on what the session may keep using.
+    """
+    monkeypatch.setenv("OPENROUTER_API_KEY", "sk-or-test")
+    monkeypatch.setattr(
+        "jaz_agent.tui.list_models",
+        lambda backend: ["aion-labs/aion-2.0", "openai/gpt-5-mini"],
+    )
+    session, _ = _switchable_session()
+    app = CodingAgentApp(session)
+
+    async def run():
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            await _run_command(app, pilot, f"/switchmodules {session.model}")
+            return session.model, app.screen.query_one("#transcript").dump()
+
+    model, lines = asyncio.run(run())
+    blob = "\n".join(lines)
+    print("\n--- typing the current model id ---")
+    print(blob)
+
+    assert model == "stealth/space-bunny-alpha"
+    assert "already on" in blob
+    assert "no model matches" not in blob
+
+
+def test_status_bar_shows_the_live_model(monkeypatch):
+    """The model must be readable from the status line, not only the banner.
+
+    The banner is the first line a narrow terminal clips, and the status line
+    is where the rest of the session state already is -- so a switch has to
+    show up in both, or "which model am I on?" depends on the window width.
+    """
+    monkeypatch.setenv("OPENROUTER_API_KEY", "sk-or-test")
+    monkeypatch.setattr(
+        "jaz_agent.tui.list_models",
+        lambda backend: ["stealth/space-bunny-alpha", "openai/gpt-5-mini"],
+    )
+    session, _ = _switchable_session()
+    app = CodingAgentApp(session)
+
+    async def run():
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            before = app.screen.query_one("#status").model
+            await _run_command(app, pilot, "/switchmodules openai/gpt-5-mini")
+            return before, app.screen.query_one("#status").model
+
+    before, after = asyncio.run(run())
+    print(f"\n--- status line model ---\nbefore={before!r}\nafter={after!r}")
+
+    assert session.model == "openai/gpt-5-mini", "the fixture did not switch"
+    assert "space-bunny-alpha" in before, "the status line never had the model"
+    assert "gpt-5-mini" in after, "the status line still names the old model"
 
 
 def test_escape_closes_the_model_picker(monkeypatch):
@@ -1627,3 +1897,245 @@ def test_a_mistyped_backend_is_an_error_not_a_search(monkeypatch):
     assert "deepseek" in blob, "the known names must come with the complaint"
     assert not rows, "a mistyped backend opened a model list"
     assert session.backend.name == "openrouter"
+
+
+# --------------------------------------------------------------------------
+# copying out of the TUI
+# --------------------------------------------------------------------------
+
+
+def _transcript(app):
+    """The transcript, and the offset of its first content cell.
+
+    ``pilot.mouse_down`` measures its offset from the widget's own corner while
+    the drag itself is about content cells, and the transcript draws a border
+    and a column of padding. Doing the conversion once here keeps the tests
+    about what was selected rather than about where the border is.
+    """
+    widget = app.screen.query_one("#transcript")
+    return widget, widget.content_region.offset - widget.region.offset
+
+
+async def _drag(app, pilot, start: tuple[int, int], end: tuple[int, int]) -> None:
+    """Drag the mouse over the transcript, from one content cell to another."""
+    _, origin = _transcript(app)
+    await pilot.mouse_down(
+        "#transcript", offset=(origin.x + start[0], origin.y + start[1])
+    )
+    await pilot.mouse_up("#transcript", offset=(origin.x + end[0], origin.y + end[1]))
+
+
+async def _two_known_rows(app, pilot) -> None:
+    """Replace the transcript with two rows whose columns are known."""
+    assert app.transcript is not None
+    app.transcript.clear()
+    app._say("alpha bravo", Kind.RESULT)
+    app._say("charlie delta", Kind.OUTPUT)
+    await pilot.pause()
+
+
+def _selection_colour(app):
+    """The style Textual paints a selection with."""
+    return app.screen.get_component_rich_style("screen--selection").bgcolor
+
+
+def _painted(app) -> str:
+    """The text of the transcript's first row that carries the selection colour.
+
+    Read from the widget's own rendered row rather than from a screenshot: the
+    question is whether the span the screen computed is drawn, and that is
+    exactly what ``_render_line`` decides.
+    """
+    transcript, _ = _transcript(app)
+    row = transcript._render_line(0, 0, transcript.size.width)
+    wanted = _selection_colour(app)
+    return "".join(
+        segment.text
+        for segment in row
+        if segment.style is not None and segment.style.bgcolor == wanted
+    )
+
+
+def test_a_drag_selects_the_characters_under_it():
+    """A drag must name characters of the log, not the whole log.
+
+    ``RichLog`` is the one scrolling text widget in Textual without selection
+    support: it answers no ``get_selection``, tags its strips with no
+    coordinates and paints nothing. A drag over it therefore selected a widget
+    that could not say what was in it, and the selected text came back empty.
+    """
+    session, _ = _switchable_session()
+    app = CodingAgentApp(session)
+
+    async def run():
+        async with app.run_test(size=(90, 30)) as pilot:
+            await pilot.pause()
+            await _two_known_rows(app, pilot)
+
+            await _drag(app, pilot, (2, 0), (7, 0))
+            one_row = app.screen.get_selected_text()
+            await _drag(app, pilot, (2, 0), (8, 2))
+            several = app.screen.get_selected_text()
+            return one_row, several
+
+    one_row, several = asyncio.run(run())
+    print(f"\n--- selected {one_row!r} then {several!r}")
+
+    # The mouse column is inclusive: Textual adds a column to the end offset, so
+    # "alpha" arrives with the space that followed it.
+    assert one_row == "alpha "
+    # Across rows the middle empty line is part of the selection, and the last
+    # row stops at the cell the mouse was over.
+    assert several == "alpha bravo\n\n  charlie"
+
+
+def test_the_selection_is_painted_in_the_transcript():
+    """A selection nobody can see is one nobody will trust."""
+    session, _ = _switchable_session()
+    app = CodingAgentApp(session)
+
+    async def run():
+        async with app.run_test(size=(90, 30)) as pilot:
+            await pilot.pause()
+            await _two_known_rows(app, pilot)
+            before = _painted(app)
+            await _drag(app, pilot, (2, 0), (7, 0))
+            return before, _painted(app)
+
+    before, after = asyncio.run(run())
+    print(f"\n--- painted {before!r} then {after!r}")
+
+    assert before == "", "an unselected row was already drawn as selected"
+    assert after == "alpha ", "the painted span is not the selected span"
+
+
+def test_ctrl_c_copies_the_selection(monkeypatch):
+    """Ctrl+C copies the selection, all the way to the machine's clipboard.
+
+    The native write is stubbed out -- a test must not empty the clipboard of
+    whoever runs it -- but the call is asserted, because writing only an escape
+    sequence into a terminal that ignores it is precisely what "cannot copy"
+    looked like from the outside.
+    """
+    copied: list[str] = []
+    monkeypatch.setattr(tui, "copy_text", lambda text: copied.append(text) or True)
+    session, _ = _switchable_session()
+    app = CodingAgentApp(session)
+
+    async def run():
+        async with app.run_test(size=(90, 30)) as pilot:
+            await pilot.pause()
+            await _two_known_rows(app, pilot)
+            await _drag(app, pilot, (2, 0), (7, 0))
+            offered = app.status.note
+            await pilot.press("ctrl+c")
+            return offered, app.clipboard, app.status.note
+
+    offered, clipboard, note = asyncio.run(run())
+    print(f"\n--- status: {offered!r} then {note!r}")
+
+    assert offered == "6 chars selected — Ctrl+C copies"
+    assert clipboard == "alpha "
+    assert copied == ["alpha "], "the machine's clipboard was never asked"
+    assert note == "copied 6 chars", "a silent copy cannot be told from a dead key"
+
+
+def test_ctrl_c_with_nothing_selected_still_cancels():
+    """The other half of the binding, which used to be lost with the first.
+
+    Textual copies only when there *is* a selection and lets the key fall
+    through to ``cancel`` when there is not -- but it decides by asking the
+    widget, and an empty string is not ``None``. A transcript that answered
+    "nothing" therefore swallowed Ctrl+C: no copy *and* no cancel.
+    """
+    session, _ = _switchable_session()
+    app = CodingAgentApp(session)
+
+    async def run():
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            await pilot.press("ctrl+c")
+            return "\n".join(app.screen.query_one("#transcript").dump())
+
+    blob = asyncio.run(run())
+    print(f"\n--- after Ctrl+C with no selection\n{blob}")
+
+    assert "nothing running" in blob, "Ctrl+C did not reach the cancel action"
+
+
+def test_copy_sends_the_last_reply(monkeypatch):
+    """``/copy`` is for what the mouse cannot reach: the answer, as written.
+
+    A reply longer than the window cannot be dragged over, and the transcript
+    holds up to 2000 lines. The text comes from the event the agent sent rather
+    than from the screen, so it arrives without the transcript's marker and
+    without the line breaks the renderer added.
+    """
+    copied: list[str] = []
+    monkeypatch.setattr(tui, "copy_text", lambda text: copied.append(text) or True)
+    session, calls = _scripted_session()
+    app = CodingAgentApp(session)
+
+    async def run():
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            box = app.screen.query_one("#task")
+            box.value = "inspect the workspace"
+            await pilot.press("enter")
+            await _drive(pilot, session, calls)
+            await _run_command(app, pilot, "/copy")
+            return app.status.note
+
+    note = asyncio.run(run())
+    print(f"\n--- /copy: {copied!r} ({note!r})")
+
+    assert copied == ["tui selftest: workspace inspected"]
+    assert note == "copied 33 chars"
+
+
+def test_copy_all_sends_the_transcript(monkeypatch):
+    """``/copy all`` takes the whole scrollback, markers and all."""
+    copied: list[str] = []
+    monkeypatch.setattr(tui, "copy_text", lambda text: copied.append(text) or True)
+    session, _ = _switchable_session()
+    app = CodingAgentApp(session)
+
+    async def run():
+        async with app.run_test(size=(90, 30)) as pilot:
+            await pilot.pause()
+            await _two_known_rows(app, pilot)
+            await _run_command(app, pilot, "/copy all")
+            return app.status.note
+
+    note = asyncio.run(run())
+    print(f"\n--- /copy all: {copied[0]!r} ({note!r})")
+
+    assert copied, "/copy all copied nothing"
+    assert copied[0].splitlines()[:3] == ["✓ alpha bravo", "", "  charlie delta"]
+    # Four rows, not three: every event ends with a blank line, and the copy is
+    # the log as it stands rather than a tidied version of it.
+    assert note == "copied 4 lines"
+
+
+def test_copy_says_so_when_there_is_nothing_to_copy(monkeypatch):
+    """An empty clipboard would be indistinguishable from a broken copy."""
+    copied: list[str] = []
+    monkeypatch.setattr(tui, "copy_text", lambda text: copied.append(text) or True)
+    session, _ = _switchable_session()
+    app = CodingAgentApp(session)
+
+    async def run():
+        async with app.run_test(size=(90, 30)) as pilot:
+            await pilot.pause()
+            assert app.transcript is not None
+            app.transcript.clear()
+            await _run_command(app, pilot, "/copy")
+            await _run_command(app, pilot, "/copy sideways")
+            return "\n".join(app.transcript.dump())
+
+    blob = asyncio.run(run())
+    print(f"\n--- /copy with nothing\n{blob}")
+
+    assert not copied
+    assert "nothing to copy yet" in blob
+    assert "takes no argument" in blob

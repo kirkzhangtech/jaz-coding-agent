@@ -629,6 +629,35 @@ def test_switch_strips_a_prefix_from_the_wrong_backend(monkeypatch):
     assert BACKENDS["anthropic"].route(session.model) == "anthropic/claude-sonnet-4-5"
 
 
+def test_switching_to_the_live_model_is_a_no_op(monkeypatch):
+    """Re-selecting the model already in use must not burn a probe.
+
+    ``/switchmodules`` lists the current model so it can be *seen*, and the
+    catalogue need not contain it; naming it again -- by picking its row or by
+    typing its id -- is not a switch. Probing anyway would spend a live request
+    to prove something already proven.
+    """
+    import jaz_agent.session as session_mod
+
+    monkeypatch.setenv("OPENROUTER_API_KEY", "sk-or-test")
+    calls: list[int] = []
+
+    def fake_probe(llm):
+        calls.append(1)
+        return "authentication failed — the API key was rejected"
+
+    monkeypatch.setattr(session_mod, "probe", fake_probe)
+
+    session = AgentSession()  # no injected llm: the probe path is live
+    before = (session.backend, session.model)
+
+    note = session.switch_model(session.model)
+
+    assert (session.backend, session.model) == before, "the no-op changed the state"
+    assert "already on" in note, note
+    assert not calls, "a probe was spent proving the current model works"
+
+
 def test_a_failed_probe_leaves_the_model_alone(monkeypatch):
     """The whole point of probing first: a bad target changes nothing.
 
@@ -764,6 +793,33 @@ def test_probe_translates_common_failures():
 
     assert "authentication" in _describe(AuthenticationError("401 unauthorized"))
     assert "not found" in _describe(Exception("model does not exist"))
+    # Real payload, captured from a live probe. It is a 404 that never says
+    # "not found", so the generic branch used to hand the user a raw litellm
+    # wrapper naming an adapter they have never heard of.
+    assert "batch" in _describe(
+        Exception(
+            'litellm.NotFoundError: OpenrouterException - {"error":{"message":'
+            '"openai/gpt-5-mini:batch cannot be used with the chat/completions '
+            'endpoint (adapter OpenAIBatchAdapter).","code":404}}'
+        )
+    )
+    # Also a real payload, from a frozen build with no tiktoken plugin. litellm
+    # raises it as APIConnectionError because the failure happens while the
+    # request is being prepared, so the class name alone says "network".
+    assert "tokenizer" in _describe(
+        Exception(
+            "litellm.APIConnectionError: OpenrouterException - Unknown encoding "
+            "cl100k_base.\nPlugins found: []\ntiktoken version: 0.14.0"
+        )
+    )
+    # And a 403 geo-block, also captured live: OpenRouter gates some models per
+    # region. The raw body is long JSON; the reason has to be said in words.
+    assert "region" in _describe(
+        Exception(
+            'litellm.APIError: APIError: OpenrouterException - {"error":{"message":'
+            '"This model is not available in your region.","code":403}}'
+        )
+    )
     assert "rate limited" in _describe(Exception("429 rate limit exceeded"))
     assert "credits" in _describe(Exception("insufficient credits"))
     assert "network" in _describe(Exception("connection refused"))
@@ -771,6 +827,100 @@ def test_probe_translates_common_failures():
     generic = _describe(ValueError("line one\nline two"))
     assert "ValueError" in generic
     assert "\n" not in generic
+
+
+def test_max_tokens_can_be_capped_from_the_environment(monkeypatch):
+    """The escape hatch for an account too small for the model's full output.
+
+    OpenRouter refuses the request outright rather than truncating: "You
+    requested up to 65536 tokens, but can only afford 18377". Capping the ask is
+    the only thing the user can do about it, and it must stay opt-in -- a silent
+    ceiling on every answer would be a worse default than an error.
+    """
+    from jaz_agent.llm_config import LLMConfigError, build_llm
+
+    monkeypatch.setenv("OPENROUTER_API_KEY", "sk-or-test")
+    monkeypatch.delenv("JAZ_MAX_TOKENS", raising=False)
+
+    # Unset: nothing is added, so the model's own default stands.
+    assert "max_tokens" not in build_llm("openai/gpt-5-mini").request_defaults
+
+    monkeypatch.setenv("JAZ_MAX_TOKENS", "8192")
+    assert build_llm("openai/gpt-5-mini").request_defaults["max_tokens"] == 8192
+
+    # A typo must fail at the point of the mistake, not as a TypeError deep in
+    # the request path.
+    monkeypatch.setenv("JAZ_MAX_TOKENS", "8k")
+    with pytest.raises(LLMConfigError, match="whole number"):
+        build_llm("openai/gpt-5-mini")
+
+
+def test_the_credit_refusal_names_the_knob(monkeypatch):
+    """Real payload from a live run against a low-balance account."""
+    from jaz_agent.llm_config import _describe
+
+    raw = (
+        'litellm.APIError: OpenrouterException - {"error":{"message":"This request '
+        "requires more credits, or fewer max_tokens. You requested up to 65536 tokens, "
+        'but can only afford 18377.","code":402}}'
+    )
+    message = _describe(Exception(raw.replace(chr(10), " ")))
+    assert "JAZ_MAX_TOKENS" in message
+    assert "credits" in message
+
+
+def test_batch_variants_are_never_offered(monkeypatch):
+    """A menu must not offer a model the agent cannot call.
+
+    OpenRouter's ``:batch`` ids are the Batches API, and ``chat/completions``
+    refuses them outright (captured live: *"cannot be used with the
+    chat/completions endpoint (adapter OpenAIBatchAdapter)"*). The live
+    catalogue carries 33 of them, so every one of those rows was a switch that
+    could only fail -- the user picks a model that looks ordinary and is told it
+    is unusable.
+
+    The chat *variants* (``:free``, ``:nitro``, ``:online``) route to the same
+    endpoint, so they stay: the filter is about the endpoint, not about colons.
+    """
+    import jaz_agent.llm_config as cfg
+
+    monkeypatch.setattr(
+        cfg,
+        "_list_openrouter_models",
+        lambda backend: [
+            "openai/gpt-5-mini:batch",
+            "openai/gpt-5-mini:free",
+            "openai/gpt-5-mini",
+            "google/gemini-2.5-flash:batch",
+        ],
+    )
+    offered = cfg.list_models(cfg.resolve_backend("openrouter"))
+
+    assert offered == ["openai/gpt-5-mini:free", "openai/gpt-5-mini"]
+    # And the filter is the same one the fallback menu goes through.
+    assert cfg.chat_models(["a:batch", "a", "B:BATCH"]) == ["a"]
+
+
+def test_a_missing_key_says_the_process_cannot_see_it(monkeypatch):
+    """The common false alarm is a key that is set *elsewhere*.
+
+    "I configured OPENROUTER_API_KEY and it still says no API key" is almost
+    always a launch-order problem: environment variables are inherited at
+    launch, so a shell or IDE opened first cannot pass them on. The message has
+    to say so, or it reads as "your key is wrong".
+    """
+    from jaz_agent.llm_config import LLMConfigError, resolve_backend
+
+    for var in ("OPENROUTER_API_KEY", "OR_API_KEY"):
+        monkeypatch.delenv(var, raising=False)
+
+    with pytest.raises(LLMConfigError) as caught:
+        resolve_backend("openrouter").find_key()
+
+    message = str(caught.value)
+    assert "this process cannot see" in message
+    assert "OPENROUTER_API_KEY" in message
+    assert "openrouter.ai/keys" in message
 
 
 def test_probe_names_a_model_rejected_as_invalid():

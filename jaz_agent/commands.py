@@ -58,6 +58,11 @@ COMMANDS: tuple[Command, ...] = (
     Command("backends", "", "list backends and whether each has a key"),
     Command("new", "", "drop conversation history"),
     Command("context", "", "what the agent remembers, and what it sends"),
+    Command(
+        "copy",
+        "[all]",
+        "last reply to the clipboard, or `all` for the transcript",
+    ),
     Command("clear", "", "clear the transcript"),
     Command("cancel", "", "stop the running turn"),
     Command("cost", "", "turns, spend and elapsed time", aliases=("c",)),

@@ -20,15 +20,19 @@ from pathlib import Path
 from typing import Callable
 
 from rich.markup import escape
+from textual import events
 from textual.app import App, ComposeResult
 from textual.binding import Binding
 from textual.containers import Horizontal
 from textual.message import Message
 from textual.reactive import reactive
+from textual.selection import Selection
+from textual.strip import Strip
 from textual.suggester import Suggester
 from textual.widgets import Footer, Header, Input, RichLog, Static
 
 from .bridge import Event, Kind, QueueDrain
+from .clipboard import copy_text
 from .commands import (
     COMMANDS,
     RETIRED,
@@ -306,6 +310,17 @@ def _row_offsets(rows: list[Candidate]) -> list[int]:
     return offsets
 
 
+def _quantity(text: str) -> str:
+    """``7 lines`` or ``31 chars`` -- how much a copy or a selection holds.
+
+    The count is what makes the note worth showing: "copied" alone does not say
+    whether a drag caught one word or a whole turn, and a copy that quietly took
+    nothing looks the same as one that worked.
+    """
+    lines = text.count("\n") + 1
+    return f"{lines} lines" if lines > 1 else f"{len(text)} chars"
+
+
 class Transcript(RichLog):
     """Append-only, size-capped view of everything the agent did.
 
@@ -314,6 +329,17 @@ class Transcript(RichLog):
     a ring here. Markup and highlighting are both off at construction: agent
     output -- file contents, tracebacks, shell output -- routinely contains
     square brackets that rich would otherwise try to parse as tags.
+
+    Selection has to be wired up by hand here, which is the one thing about this
+    widget that is not obvious. ``RichLog`` is the only scrolling text widget in
+    Textual without it: the older ``Log`` answers ``get_selection``, tags each
+    rendered strip with the coordinates of every character it holds and paints
+    the selected span itself, and the general path does the same for widgets
+    that render a ``Visual``. A ``RichLog`` renders its own strips, so with none
+    of that a drag produced no highlight, and ``Screen.get_selected_text()``
+    returned the empty string -- Ctrl+C then copied nothing *and* stopped
+    cancelling a running turn, because Textual could see that something had been
+    selected and so had no reason to fall through to the next binding.
     """
 
     def __init__(self, **kwargs) -> None:
@@ -331,26 +357,91 @@ class Transcript(RichLog):
             self.write(f"{marker} {line}")
         self.write("")
 
-    def dump(self) -> list[str]:
-        """Best-effort read of the rendered lines, for tests and debugging.
+    def lines_text(self) -> list[str]:
+        """One plain string per stored line, padding removed.
 
-        RichLog does not expose its line buffer publicly, so this walks the
-        renderable chunks. Returns ``[]`` rather than raising when the internal
-        shape changes -- it is a diagnostic helper, never load-bearing.
+        The strips are the source of truth rather than the strings that were
+        written, because a line long enough to wrap is stored as one strip per
+        visual row: reading them back is then the same text a selection can
+        name, so what is copied is what is on screen. The trailing spaces come
+        from ``RichLog``, which extends every line to the render width.
         """
-        out: list[str] = []
-        for attr in ("lines", "_lines", "_line_cache"):
-            buf = getattr(self, attr, None)
-            if buf is None:
-                continue
-            try:
-                for item in buf:
-                    text = getattr(item, "text", item)
-                    out.append(text.plain if hasattr(text, "plain") else str(text))
-                return out
-            except Exception:
-                continue
-        return out
+        return [strip.text.rstrip() for strip in self.lines]
+
+    def text(self) -> str:
+        """The whole transcript as plain text, for ``/copy all``."""
+        return "\n".join(self.lines_text())
+
+    def get_selection(self, selection: Selection) -> tuple[str, str] | None:
+        """Text under *selection*, in the coordinate space the lines are in.
+
+        ``Widget.get_selection`` is written for widgets that own a single
+        renderable -- it re-renders and extracts from the result, which for a
+        ``RichLog`` is a ``RichVisual`` and yields nothing. The offsets this
+        widget reports (see :meth:`render_line`) are line-and-column positions
+        in the stored lines, so the text is assembled from those instead.
+        """
+        return selection.extract(self.text()), "\n"
+
+    def render_line(self, y: int) -> Strip:
+        """One visible row, tagged with the position of every character in it.
+
+        The tagging is what makes a drag land on characters instead of on the
+        whole widget: Textual turns the mouse position into a line and column by
+        reading this metadata off the rendered segments, and with none of it a
+        selection can only ever mean "all of this widget".
+
+        The y passed on is the position in the stored lines rather than the row
+        on screen, so a selection survives scrolling -- and so it agrees with
+        the text :meth:`get_selection` extracts.
+        """
+        strip = super().render_line(y)
+        scroll_x, scroll_y = self.scroll_offset
+        line = scroll_y + y
+        if line >= len(self.lines):
+            # Blank space below the last line is not text; leaving it untagged
+            # keeps it from becoming a selection that copies nothing.
+            return strip
+        return strip.apply_offsets(scroll_x, line)
+
+    def _render_line(self, y: int, scroll_x: int, width: int) -> Strip:
+        """Draw one stored line, with the selected span highlighted.
+
+        Painting it here is not a preference: the compositor highlights a
+        selection for the widgets whose lines it renders itself, and this widget
+        renders its own. ``Log`` does the same thing for the same reason.
+
+        The span arrives in stored-line columns while the strip has already been
+        cropped to the visible window, so it is shifted by ``scroll_x`` -- on a
+        horizontally scrolled line, the highlight would otherwise sit off the
+        text by exactly the amount scrolled.
+        """
+        strip = super()._render_line(y, scroll_x, width)
+        selection = self.text_selection
+        if selection is None:
+            return strip
+        span = selection.get_span(y)
+        if span is None:
+            return strip
+
+        start, end = span
+        if end == -1:
+            # -1 is "to the end of the line", which is only known here.
+            end = strip.cell_length + scroll_x
+        start = max(0, start - scroll_x)
+        end = min(strip.cell_length, end - scroll_x)
+        if start >= end:
+            return strip
+
+        style = self.screen.get_component_rich_style("screen--selection")
+        parts = [strip.crop(0, start), strip.crop(start, end).apply_style(style)]
+        if end < strip.cell_length:
+            parts.append(strip.crop(end))
+        return Strip.join(parts)
+
+    def dump(self) -> list[str]:
+        """The rendered lines, for tests and debugging."""
+        return self.lines_text()
 
 
 class StatusBar(Static):
@@ -359,7 +450,15 @@ class StatusBar(Static):
     DEFAULT_CSS = ""
 
     state: reactive[str] = reactive("ready")
+    #: ``model via backend``: the same string the banner and ``/status`` show.
+    #: Kept here as well because the banner is the first line a narrow window
+    #: clips, and "which model am I on?" must not depend on the window width.
+    model: reactive[str] = reactive("")
     detail: reactive[str] = reactive("")
+    #: Something the user did, not something the agent did: "copied 7 lines".
+    #: Separate from ``detail`` so a copy reported mid-turn cannot overwrite
+    #: "agent working" and leave the status line lying about the run.
+    note: reactive[str] = reactive("")
     turns: reactive[int] = reactive(0)
     cost: reactive[str] = reactive("")
     elapsed: reactive[str] = reactive("0:00")
@@ -368,12 +467,16 @@ class StatusBar(Static):
         """Compose the status line; rich markup only, never user text."""
         colour = "warning" if self.state == "busy" else ("error" if self.state == "error" else "green")
         bits = [f"[{colour}]{self.state}[/]", f"[dim]{self.elapsed}[/]"]
+        if self.model:
+            bits.append(f"[dim]{self.model}[/]")
         if self.turns:
             bits.append(f"[dim]turn {self.turns}[/]")
         if self.cost:
             bits.append(f"[dim]{self.cost}[/]")
         if self.detail:
             bits.append(f"[dim]{self.detail}[/]")
+        if self.note:
+            bits.append(f"[dim italic]{self.note}[/]")
         return "  ".join(bits)
 
 
@@ -389,10 +492,16 @@ class CodingAgentApp(App[None]):
     # while mid-turn is worse than typing two characters.
     BINDINGS = [
         Binding("ctrl+q", "quit", "Quit", priority=True),
-        Binding("ctrl+c", "cancel", "Cancel"),
+        # The label covers both jobs on purpose: the key copies a selection, and
+        # with nothing selected it is the only way to stop a running turn. A
+        # footer that said just "Cancel" would hide half of what it does.
+        Binding("ctrl+c", "cancel", "Cancel or copy"),
         Binding("ctrl+l", "clear", "Clear"),
         Binding("f5", "cost", "Cost"),
     ]
+
+    #: How long a status note (``copied 4 lines``) stays up before it fades.
+    NOTE_SECONDS = 3.0
 
     def __init__(self, session: AgentSession | None = None, *, prompt: str | None = None) -> None:
         """Build the app around *session*, optionally auto-submitting *prompt*."""
@@ -408,9 +517,20 @@ class CodingAgentApp(App[None]):
         self.started = time.monotonic()
         self._pending_prompt = prompt
         self._busy_since: float | None = None
+        #: The model string currently on screen, so the tick can tell whether the
+        #: header needs redrawing; see :meth:`_sync_model_display`.
+        self._shown_model = ""
         #: Rows the ↑/↓ keys can move over, and which one is selected.
         self._candidates: list[Candidate] = []
         self._selected = 0
+        #: The last thing the agent finished a turn with, for ``/copy``: the
+        #: text of the event rather than a read-back of the transcript, so what
+        #: is copied is what the agent said -- no marker, no re-wrapping.
+        self._last_reply = ""
+        #: When the current status note expires, and whether it is the note
+        #: about a live selection (which is dropped when the selection is).
+        self._note_until = 0.0
+        self._sticky_note = False
         #: Set by Escape; cleared on the next edit, so the list is dismissible
         #: for the current value rather than for the rest of the session.
         self._hint_dismissed = False
@@ -454,12 +574,25 @@ class CodingAgentApp(App[None]):
     def on_mount(self) -> None:
         """Start the drain timer, render the banner and print the greeting."""
         assert self.transcript and self.status and self.prompt_box
-        self._refresh_banner()
+        self._sync_model_display()
         self._say(
             "Ready. Describe a coding task and press Enter.\n"
-            "Ctrl+C cancel · Ctrl+L clear · Ctrl+Q quit · type / for commands",
+            "Drag to select text · Ctrl+C copies it, or cancels a run · "
+            "Ctrl+L clear · Ctrl+Q quit · / for commands",
             Kind.STATUS,
         )
+        # Said now rather than on the first failure: without a key this process
+        # cannot reach the model at all, and the user's next action (typing a
+        # task, or switching model) is the one that will not work. Saying it at
+        # the point of confusion costs a line here and saves a wrong diagnosis.
+        if not self.session.backend.has_key():
+            wanted = " or ".join(self.session.backend.key_vars)
+            self._say(
+                f"no {wanted} visible to this process — nothing can be sent to "
+                f"{self.session.backend.name}. Set it, then start jaz-agent again "
+                "from that same shell.",
+                Kind.ERROR,
+            )
         self.set_interval(0.05, self._tick)
         # Prime the completion cache in the background: Tab should offer model
         # ids from the first keystroke, and the fetch is a network call.
@@ -470,19 +603,32 @@ class CodingAgentApp(App[None]):
             text, self._pending_prompt = self._pending_prompt, None
             self.call_after_refresh(self._send, text)
 
-    def _refresh_banner(self) -> None:
-        """Redraw the header line.
+    def _sync_model_display(self) -> None:
+        """Show the live model in the header and the status line, if it moved.
 
-        Called on mount and after every successful switch, so the
-        banner never claims a model the session is no longer using.
+        Driven from the tick, not from the switch path. The display has to follow
+        the *session* rather than the event that changed it, because a redraw
+        flag puts the burden on every path that can change the model, and one
+        that forgets leaves the header naming the model the session has just
+        left -- indistinguishable, on screen, from a switch that never happened.
+        Comparing one string per tick makes the display correct by construction.
+
+        The model is shown in two places for one reason: a narrow terminal clips
+        the header first, and "which model is answering?" is the question a
+        switcher asks.
         """
-        if self.banner is None:
+        shown = self.session.model_name
+        if shown == self._shown_model:
             return
-        self.banner.update(
-            f"[bold]jaz coding agent[/]  [dim]{self.session.model_name}[/]\n"
-            f"[dim]workspace: {ROOT}[/]\n"
-            f"[dim]tools: {tool_catalog()}[/]"
-        )
+        self._shown_model = shown
+        if self.banner is not None:
+            self.banner.update(
+                f"[bold]jaz coding agent[/]  [dim]{shown}[/]\n"
+                f"[dim]workspace: {ROOT}[/]\n"
+                f"[dim]tools: {tool_catalog()}[/]"
+            )
+        if self.status is not None:
+            self.status.model = shown
 
     # -- transcript helpers ---------------------------------------------
 
@@ -490,6 +636,66 @@ class CodingAgentApp(App[None]):
         """Write to the transcript if it exists yet."""
         if self.transcript:
             self.transcript.append_event(Event(kind, text))
+
+    def _note(self, text: str, *, sticky: bool = False) -> None:
+        """Put a line in the status bar about something the *user* did.
+
+        Copying used to be completely silent, and silence is indistinguishable
+        from a Ctrl+C that was swallowed -- which is what was happening: the
+        selection existed, so the copy binding ran, and it copied an empty
+        string. One line saying how much went to the clipboard is the difference
+        between "it worked" and "I will press it again".
+
+        ``sticky`` notes stay until the thing they describe is gone (the
+        selection they are about), rather than on a timer.
+        """
+        if self.status is None:
+            return
+        self.status.note = text
+        self._sticky_note = sticky and bool(text)
+        self._note_until = 0.0 if self._sticky_note else time.monotonic() + self.NOTE_SECONDS
+
+    def _expire_note(self) -> None:
+        """Drop a status note on its timer, or when its selection has gone."""
+        if self._sticky_note:
+            # Escape and a stray click both clear the selection without telling
+            # anyone; the note is only true while the selection is there.
+            if not self.screen.selections:
+                self._clear_note()
+        elif self._note_until and time.monotonic() >= self._note_until:
+            self._clear_note()
+
+    def _clear_note(self) -> None:
+        """Take the note down. Does not arm anything, so the timer really ends."""
+        if self.status is not None:
+            self.status.note = ""
+        self._sticky_note = False
+        self._note_until = 0.0
+
+    def copy_to_clipboard(self, text: str) -> None:
+        """Copy *text*, natively as well as through the terminal, and say so.
+
+        ``App.copy_to_clipboard`` writes OSC 52 and lets the terminal own the
+        clipboard: the only mechanism that works from another machine, over ssh
+        or in tmux, and a silent no-op in most terminals on Windows. Both are
+        attempted, because the machine may be either of those two things.
+        """
+        super().copy_to_clipboard(text)
+        copy_text(text)
+        self._note(f"copied {_quantity(text)}")
+
+    def on_text_selected(self, event: events.TextSelected) -> None:
+        """Say what a drag selected, so the copy key is discoverable.
+
+        Nothing else tells the user that the transcript can be selected at all:
+        the mouse highlight is the only signal, and Ctrl+C is the only key. The
+        note names the size and the key, and disappears with the selection.
+        """
+        text = self.screen.get_selected_text()
+        if text:
+            self._note(f"{_quantity(text)} selected — Ctrl+C copies", sticky=True)
+        elif self._sticky_note:
+            self._clear_note()
 
     # -- the pump --------------------------------------------------------
 
@@ -499,6 +705,11 @@ class CodingAgentApp(App[None]):
         Everything here runs on the Textual thread, which is the only thread
         allowed to touch widgets.
         """
+        # Before the drain, and unconditionally: the header is a view of session
+        # state, so it is refreshed on the clock rather than on the news of a
+        # change arriving.
+        self._sync_model_display()
+        self._expire_note()
         events = self.drain()
         if not events:
             # Nothing new: still advance the clock so a long turn looks alive.
@@ -506,14 +717,9 @@ class CodingAgentApp(App[None]):
             return
 
         assert self.status
-        redraw = False
         for ev in events:
             if ev.kind is Kind.COST and "total_cost" in ev.payload:
                 self.status.cost = ev.payload["total_cost"]
-            # A committed model switch changes the header; the worker thread
-            # cannot redraw it, so it flags the event and the UI acts here.
-            if ev.payload.get("redraw_banner"):
-                redraw = True
             # The idle marker is the last thing a turn emits, so it is the
             # authoritative end-of-turn signal. Inferring the end from "no more
             # events" is not workable: a slow model looks identical to a finished
@@ -521,8 +727,6 @@ class CodingAgentApp(App[None]):
             if ev.payload.get("idle") or ev.payload.get("fatal"):
                 self._end_turn()
 
-        if redraw:
-            self._refresh_banner()
         self.status.turns = self.session.bridge.iterations
         if self.session.busy:
             self._mark_busy()
@@ -567,6 +771,9 @@ class CodingAgentApp(App[None]):
                 self.status.state = "error"
                 self._end_turn()
         elif event.kind is Kind.RESULT:
+            # Kept for ``/copy``: the finished turn's report, as the agent wrote
+            # it, rather than a read-back of wrapped screen lines.
+            self._last_reply = str(event.text)
             self._say(event.text, Kind.RESULT)
         elif event.kind is Kind.RETRY:
             self._say(event.text, Kind.RETRY)
@@ -642,11 +849,14 @@ class CodingAgentApp(App[None]):
         # an unrelated row as soon as the prefix narrowed the list.
         self._selected = 0
         if rows and not self._hint_dismissed:
+            # ``_render_candidates`` already writes the hint -- list, cursor,
+            # legend. Following it with ``_set_hint`` overwrote all three with
+            # the plain text, so the list appeared as a printed page: no row
+            # marked, no "↑/↓ choose" line until the user pressed a key whose
+            # purpose only that line explains.
             self._render_candidates()
         else:
             self._set_hint(hint_text(prefix, self._hint_width()))
-
-        self._set_hint(hint_text(prefix, self._hint_width()))
 
     def _retired_hint(self, prefix: str) -> str | None:
         """A redirect for a command that used to exist, if *prefix* names one."""
@@ -999,6 +1209,7 @@ class CodingAgentApp(App[None]):
             "quit": lambda: self.exit(),
             "help": lambda: self._say(help_text(), Kind.STATUS),
             "status": self._show_status,
+            "copy": lambda: self.action_copy(rest),
             "clear": self.action_clear,
             "new": self.action_new,
             "cancel": self.action_cancel,
@@ -1028,9 +1239,17 @@ class CodingAgentApp(App[None]):
         return matches[0] if matches else None
 
     def _show_status(self) -> None:
-        """Print the current model, workspace and tool list."""
+        """Print the current model, workspace and tool list.
+
+        The key state belongs here rather than in the model line: "I set
+        OPENROUTER_API_KEY and it still refuses" is the single most common
+        report, and the answer is whether *this process* can see it -- a
+        terminal opened before the variable was set cannot.
+        """
+        state = "visible" if self.session.backend.has_key() else "NOT visible to this process"
         self._say(
             f"model: {self.session.model_name}\n"
+            f"api key: {state}\n"
             f"workspace: {ROOT}\n"
             f"tools: {tool_catalog()}",
             Kind.STATUS,
@@ -1145,6 +1364,14 @@ class CodingAgentApp(App[None]):
             self._commit(None, target)
             return
 
+        # Naming the model that is already live is not a filter, and the
+        # catalogue is the wrong authority on it: the model the session is on
+        # need not be listed (see ``_emit_models``). Asked before the fetch,
+        # which is what makes the row the browser shows for it usable.
+        if self.session.is_current(model, target):
+            self._commit(model, target)
+            return
+
         try:
             models = list_models(target)
         except Exception as exc:
@@ -1178,7 +1405,7 @@ class CodingAgentApp(App[None]):
             return
 
         self.suggester.invalidate()
-        self.session.bridge.emit(Kind.RESULT, note, redraw_banner=True)
+        self.session.bridge.emit(Kind.RESULT, note)
         threading.Thread(
             target=self._warm_suggester, name="jaz-models-warm", daemon=True
         ).start()
@@ -1268,10 +1495,23 @@ class CodingAgentApp(App[None]):
 
         # Open on the current model. With 464 ids sorted it is near the end, so
         # starting at row 0 would mean ↓ picks a model the user was not looking
-        # at. The picker scrolls to it; when the model was filtered out of the
-        # result set there is nothing to scroll to, so say which one is live.
-        if query and current not in rows:
-            lines.append(f" current: {current}  (not in these results)")
+        # at. The picker scrolls to it; when there is no row to scroll to, the
+        # reason is stated and -- unfiltered -- the model is listed with the rest.
+        if current not in rows:
+            if query:
+                # A filter took it out of view. Listing it would misrepresent
+                # what matched, so it is only named.
+                lines.append(f" current: {current}  (not in these results)")
+            else:
+                # The catalogue does not offer it: a stealth alias, a model
+                # released since the fetch, a provider with no ``/models`` at
+                # all. This is not hypothetical -- the live OpenRouter list does
+                # not contain this session's default -- and without the row the
+                # whole list came back with no tick on any line, so the model in
+                # use was invisible and Enter committed whichever unrelated
+                # model happened to be first.
+                lines.append(f" current: {current}  (not in this catalogue)")
+                rows.insert(0, current)
 
         self.session.bridge.emit(
             Kind.STATUS,
@@ -1327,6 +1567,34 @@ class CodingAgentApp(App[None]):
             self._say("nothing running", Kind.STATUS)
             return
         self.session.cancel()
+
+    def action_copy(self, argument: str = "") -> None:
+        """``/copy`` — the last reply, or with ``all`` the whole transcript.
+
+        The mouse cannot reach most of what is worth copying: only the visible
+        window can be dragged over, and the transcript holds up to 2000 lines.
+        This is the path that does not depend on the window size, or on the
+        terminal agreeing about how scrolling works.
+
+        The last reply is the interesting default -- it is the answer to "that
+        is useful, put it somewhere" -- and it comes from the event the agent
+        sent rather than from the screen, so it is unmarked and unwrapped.
+        """
+        wanted = argument.strip().lower()
+        if not wanted:
+            if not self._last_reply:
+                self._say("nothing to copy yet — no turn has finished", Kind.ERROR)
+                return
+            self.copy_to_clipboard(self._last_reply)
+            return
+        if wanted == "all":
+            whole = self.transcript.text() if self.transcript else ""
+            if not whole.strip():
+                self._say("the transcript is empty — nothing to copy", Kind.ERROR)
+                return
+            self.copy_to_clipboard(whole)
+            return
+        self._say(f"/copy takes no argument, or all — not {argument!r}", Kind.ERROR)
 
     def action_cost(self) -> None:
         """Show accumulated usage for this session."""

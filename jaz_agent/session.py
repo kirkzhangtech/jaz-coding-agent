@@ -30,6 +30,7 @@ from jaz.repl.python_repl import PythonREPL
 from .bridge import EventBridge, Kind
 from .context import Context
 from .llm_config import (
+    Backend,
     LLMConfigError,
     build_llm,
     default_model_for,
@@ -151,6 +152,19 @@ class AgentSession:
         """
         return self.running
 
+    def is_current(self, model: str, backend: Backend | None = None) -> bool:
+        """True if *model* on *backend* is the pair already in use.
+
+        One definition of "already there", because two callers need it for
+        different reasons and must not disagree. ``switch_model`` uses it to
+        skip a probe that would prove nothing; the browser uses it to recognise
+        the row it shows for the live model, which the catalogue need not
+        contain -- so falling through to a catalogue lookup for it would report
+        "no model matches" for the model on screen.
+        """
+        target = backend or self.backend
+        return target is self.backend and target.bare(model) == self.model
+
     def switch_model(
         self, model: str | None = None, *, backend: str | None = None
     ) -> str:
@@ -190,6 +204,14 @@ class AgentSession:
                 )
             bare = default_model_for(target_backend)
         bare = target_backend.bare(bare)
+
+        # Already there. Re-selecting the live model is not a switch: the
+        # browser deliberately lists it so the user can see where they are, and
+        # Enter on that row must neither spend a probe proving something
+        # already proven nor be refused for not being in a catalogue it is not
+        # in. Reported rather than ignored, so the UI can say so.
+        if self.is_current(bare, target_backend):
+            return f"already on {bare} — nothing to switch"
 
         candidate = target_backend.build(bare)
 
